@@ -517,25 +517,39 @@ echo "ГОТОВЫЙ ОТЧЁТ — скопируйте всё, что ниже
 echo "===================================================="
 cat "$FINAL"
 echo "===================================================="
-echo "Конец отчёта. Как скопировать всё, что выше:"
-echo "  PuTTY:            зажмите ЛКМ в начале отчёта и, не отпуская, потяните"
-echo "                     вниз до конца — текст копируется сам, без Ctrl+C"
-echo "                     (правый клик мыши — вставить)."
-echo "  Windows Terminal:  выделите текст мышью, затем Ctrl+Shift+C."
-echo "  macOS Terminal/iTerm2: выделите текст мышью, затем Cmd+C."
-echo
-echo "Если терминал всё равно обрезает верх отчёта (маленький буфер прокрутки"
-echo "в PuTTY/MobaXterm/Termius) — самый надёжный способ получить отчёт целиком:"
-echo "запустите эту же команду с ЛОКАЛЬНОГО терминала (не внутри сессии на"
-echo "сервере) с перенаправлением в файл на своём компьютере, например:"
+echo "Конец отчёта. Если терминал обрезает его сверху (маленький буфер"
+echo "прокрутки в PuTTY/MobaXterm/Termius) — надёжный способ получить отчёт"
+echo "целиком: запустите эту же команду с ЛОКАЛЬНОГО терминала (не внутри"
+echo "уже открытой сессии на сервере) с перенаправлением в файл у себя:"
 echo "  ssh root@${SERVER_PUBLIC_IP:-IP_СЕРВЕРА} 'curl -fsSL https://raw.githubusercontent.com/lyfreedomitsme/server-audit/main/server_audit.sh | bash' > report.txt"
 echo "Файл report.txt появится у вас на компьютере целиком, без обрезаний."
 echo "===================================================="
 
-if [ "${PASTE:-0}" = "1" ]; then
+PASTE_TTL_DEFAULT=15
+DO_PASTE=0
+case "${PASTE:-}" in
+  1|y|Y|yes|YES) DO_PASTE=1 ;;
+  0|n|N|no|NO) DO_PASTE=0 ;;
+  *)
+    if [ -r /dev/tty ]; then
+      echo
+      echo "Опубликовать отчёт на termbin.com? Ссылка публичная, без пароля,"
+      echo "будет активна ${PASTE_TTL:-$PASTE_TTL_DEFAULT} сек. — скрипт сам её удалит."
+      PASTE_ANSWER=""
+      read -r -p "y/N: " PASTE_ANSWER 2>/dev/null < /dev/tty || PASTE_ANSWER=""
+      case "$PASTE_ANSWER" in
+        y|Y|yes|Yes|YES) DO_PASTE=1 ;;
+        *) DO_PASTE=0 ;;
+      esac
+    fi
+    ;;
+esac
+
+if [ "$DO_PASTE" = "1" ]; then
+  PASTE_TTL="${PASTE_TTL:-$PASTE_TTL_DEFAULT}"
   echo
   if has nc; then
-    echo "[*] PASTE=1: заливаю отчёт на termbin.com (публичная ссылка, БЕЗ пароля)..."
+    echo "[*] Заливаю отчёт на termbin.com (публичная ссылка, БЕЗ пароля)..."
     PASTE_URL=$(cat "$FINAL" | nc termbin.com 9999 2>/dev/null | tr -d '\0' | tr -d '[:space:]' | tail -c 200)
     if [ -n "$PASTE_URL" ]; then
       PASTE_SLUG="${PASTE_URL##*/}"
@@ -544,10 +558,10 @@ if [ "${PASTE:-0}" = "1" ]; then
       echo "    она окажется. Пароли/токены/ключи из отчёта уже вырезаны, но хостнеймы,"
       echo "    IP и список софта останутся видны. Не используйте для чувствительных серверов."
       if has curl; then
-        echo "Удалить ссылку можно (работает первые 10 минут с этого же IP):"
+        echo "Удалить раньше срока можно вручную (первые 10 минут, с этого же IP):"
         echo "  curl -X POST \"https://termbin.com/delete?slug=$PASTE_SLUG\""
-        if [ -n "${PASTE_TTL:-}" ] && [ "${PASTE_TTL:-0}" -gt 0 ] 2>/dev/null; then
-          echo "[*] PASTE_TTL=$PASTE_TTL: удалю ссылку сама через $PASTE_TTL сек. Успейте скопировать/открыть."
+        if [ "$PASTE_TTL" -gt 0 ] 2>/dev/null; then
+          echo "[*] Удалю ссылку сама через $PASTE_TTL сек. Успейте скопировать/открыть."
           ( sleep "$PASTE_TTL"
             DEL=$(curl -s -X POST "https://termbin.com/delete?slug=$PASTE_SLUG")
             echo "[*] termbin: $DEL" >&3
@@ -559,6 +573,6 @@ if [ "${PASTE:-0}" = "1" ]; then
       echo "[!] Не удалось залить на termbin.com (нет сети или сервис недоступен) — используйте текст выше."
     fi
   else
-    echo "[!] PASTE=1 запрошен, но netcat (nc) не установлен — пропущено."
+    echo "[!] netcat (nc) не установлен — публикация на termbin.com пропущена."
   fi
 fi
