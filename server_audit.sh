@@ -393,15 +393,82 @@ fi
 
 # ---------- 8. ПАНЕЛИ УПРАВЛЕНИЯ ----------
 sep "CONTROL PANELS"
-[ -d /usr/local/hestia ] && { echo "HestiaCP найдена:"; run "/usr/local/hestia/bin/v-list-sys-config 2>/dev/null | head -n 20"; }
-[ -d /usr/local/mgr5 ] && { echo "ISPmanager найдена"; svc_active ispmgr && echo "ispmgr: active"; }
-[ -d /usr/local/fastpanel2 ] && { echo "FastPanel найдена"; svc_active fastpanel2 && echo "fastpanel2: active"; }
-[ -d /usr/local/directadmin ] && { echo "DirectAdmin найдена"; svc_active directadmin && echo "directadmin: active"; }
-[ -d /www/server/panel ] && echo "aaPanel найдена"
-[ -d /usr/local/vesta ] && echo "VestaCP найдена"
-[ -d /usr/local/psa ] && { echo "Plesk найдена:"; run "plesk version 2>/dev/null | head -n 5"; }
-[ -d /usr/local/cpanel ] && { echo "cPanel/WHM найдена:"; run "cat /usr/local/cpanel/version 2>/dev/null"; }
-echo
+# Пути логов у панелей не всегда одинаковы между версиями/дистрибутивами —
+# пробуем несколько вероятных кандидатов, тихо пропускаем, если не нашли.
+panel_status() {
+  # panel_status "Имя" unit1 unit2 ...
+  local name="$1"; shift
+  local u active=""
+  for u in "$@"; do
+    if svc_active "$u" 2>/dev/null; then active="$u"; break; fi
+  done
+  [ -n "$active" ] && echo "$name: active ($active)" || echo "$name: сервис не найден активным (проверьте вручную)"
+}
+panel_log() {
+  # panel_log Заголовок file1 file2 ...
+  local title="$1"; shift
+  local f
+  for f in "$@"; do
+    if [ -f "$f" ]; then
+      echo "--- $title ($f, last 30) ---"
+      tail -n 30 "$f"
+      return
+    fi
+  done
+}
+
+if [ -d /usr/local/hestia ]; then
+  echo "HestiaCP найдена:"
+  run "/usr/local/hestia/bin/v-list-sys-config 2>/dev/null | head -n 20"
+  panel_status "hestia" hestia
+  panel_log "HestiaCP log" /usr/local/hestia/log/system.log /usr/local/hestia/log/error/system.log
+  echo
+fi
+if [ -d /usr/local/mgr5 ]; then
+  echo "ISPmanager найдена:"
+  panel_status "ispmgr" ispmgr
+  panel_log "ISPmanager log" /usr/local/mgr5/var/ispmgr.log /var/log/ispmgr.log
+  echo
+fi
+if [ -d /usr/local/fastpanel2 ]; then
+  echo "FastPanel найдена:"
+  panel_status "fastpanel2" fastpanel2
+  panel_log "FastPanel log" /var/log/fastpanel2/fastpanel2.log /var/log/fastpanel2.log
+  echo
+fi
+if [ -d /usr/local/directadmin ]; then
+  echo "DirectAdmin найдена:"
+  panel_status "directadmin" directadmin
+  panel_log "DirectAdmin error log" /var/log/directadmin/error.log
+  panel_log "DirectAdmin task queue errors" /var/log/directadmin/errortaskq.log
+  echo
+fi
+if [ -d /www/server/panel ]; then
+  echo "aaPanel найдена:"
+  panel_status "aaPanel" bt bt-panel btpanel
+  panel_log "aaPanel error log" /www/server/panel/logs/error.log
+  echo
+fi
+if [ -d /usr/local/vesta ]; then
+  echo "VestaCP найдена:"
+  panel_status "vesta" vesta
+  panel_log "VestaCP system log" /usr/local/vesta/log/system.log
+  echo
+fi
+if [ -d /usr/local/psa ]; then
+  echo "Plesk найдена:"
+  run "plesk version 2>/dev/null | head -n 5"
+  panel_status "plesk (sw-cp-server)" sw-cp-server psa
+  panel_log "Plesk panel log" /var/log/plesk/panel.log
+  echo
+fi
+if [ -d /usr/local/cpanel ]; then
+  echo "cPanel/WHM найдена:"
+  run "cat /usr/local/cpanel/version 2>/dev/null"
+  panel_status "cpanel" cpanel cpsrvd
+  panel_log "cPanel error log" /usr/local/cpanel/logs/error_log
+  echo
+fi
 
 # ---------- 9. ВЕБ-СЕРВЕРЫ ----------
 sep "WEB SERVERS"
@@ -521,6 +588,13 @@ if has php || [ -n "$PHP_FPM_UNITS" ] || [ -d /etc/php ] || [ -d /etc/php-fpm.d 
           printf '%s\n' "$POOLS" | sed 's/^/  - /'
         fi
       fi
+      for f in "/var/log/php$v-fpm.log" "/var/log/php/$v/fpm.log" "/var/log/php-fpm/$v-error.log"; do
+        if [ -f "$f" ]; then
+          echo "--- PHP $v FPM error log ($f, last 30) ---"
+          tail -n 30 "$f"
+          break
+        fi
+      done
       echo
     done
   elif [ -d /etc/php-fpm.d ]; then
@@ -537,6 +611,13 @@ if has php || [ -n "$PHP_FPM_UNITS" ] || [ -d /etc/php ] || [ -d /etc/php-fpm.d 
       echo "Сайты/пулы:"
       printf '%s\n' "$POOLS" | sed 's/^/  - /'
     fi
+    for f in /var/log/php-fpm/error.log /var/log/php-fpm/www-error.log; do
+      if [ -f "$f" ]; then
+        echo "--- PHP-FPM error log ($f, last 30) ---"
+        tail -n 30 "$f"
+        break
+      fi
+    done
   elif has php; then
     echo "Несколько версий PHP не обнаружено, показываю CLI php.ini:"
     PHPINI=$(php --ini 2>/dev/null | grep 'Loaded Configuration' | awk '{print $NF}')
@@ -692,7 +773,9 @@ case "${PASTE:-}" in
       echo "Опубликовать отчёт на termbin.com? Ссылка публичная, без пароля,"
       echo "будет активна ${PASTE_TTL:-$PASTE_TTL_DEFAULT} сек. — скрипт сам её удалит."
       PASTE_ANSWER=""
-      read -r -p "y/N: " PASTE_ANSWER 2>/dev/null < /dev/tty || PASTE_ANSWER=""
+      printf 'y/N: '
+      read -r PASTE_ANSWER 2>/dev/null < /dev/tty || PASTE_ANSWER=""
+      echo
       case "$PASTE_ANSWER" in
         y|Y|yes|Yes|YES) DO_PASTE=1 ;;
         *) DO_PASTE=0 ;;
@@ -718,11 +801,17 @@ if [ "$DO_PASTE" = "1" ]; then
         echo "  curl -X POST \"https://termbin.com/delete?slug=$PASTE_SLUG\""
         if [ "$PASTE_TTL" -gt 0 ] 2>/dev/null; then
           echo "[*] Удалю ссылку сама через $PASTE_TTL сек. Успейте скопировать/открыть."
-          ( sleep "$PASTE_TTL"
-            DEL=$(curl -s -X POST "https://termbin.com/delete?slug=$PASTE_SLUG")
-            echo "[*] termbin: $DEL" >&3
-          ) &
-          disown
+          # setsid отвязывает фоновую задачу от текущей сессии/управляющего
+          # терминала полностью — иначе, если вы закроете SSH-сессию раньше,
+          # чем истечёт TTL, эта задача получит SIGHUP вместе со всей сессией
+          # и не успеет удалить ссылку.
+          DELETE_CMD="sleep '$PASTE_TTL'; curl -s -X POST 'https://termbin.com/delete?slug=$PASTE_SLUG' >/dev/null 2>&1"
+          if has setsid; then
+            setsid bash -c "$DELETE_CMD" < /dev/null > /dev/null 2>&1 &
+          else
+            ( bash -c "$DELETE_CMD" < /dev/null > /dev/null 2>&1 & )
+          fi
+          disown 2>/dev/null || true
         fi
       fi
     else
