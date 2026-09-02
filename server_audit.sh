@@ -76,11 +76,13 @@ redact_file() {
   local src="$1" dst="$2"
   sed -E \
     -e '/\b(mysql|mysqldump|mariadb|mariadb-dump|psql|pg_dump|pg_restore|mongorestore|mongodump)\b/ s/(^|[[:space:]])-p([^[:space:]]{3,})/\1-p[REDACTED]/g' \
-    -e 's/((api[_-]?key|access[_-]?key|secret[_-]?key|secret|token|passwd|password|pwd)[[:space:]]*[:=][[:space:]]*)[^[:space:]]+/\1[REDACTED]/gI' \
-    -e 's#(https?://[^:/@[:space:]]+):[^@/[:space:]]+@#\1:[REDACTED]@#g' \
+    -e 's/((api[_-]?key|access[_-]?key|secret[_-]?key|service[_-]?role[_-]?key|[a-z0-9_]*_key|private[_-]?key|secret|token|passwd|password|pass|pwd)[[:space:]]*[:=][[:space:]]*)[^[:space:]]+/\1[REDACTED]/gI' \
+    -e 's#([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@[:space:]]*):[^@/[:space:]]+@#\1:[REDACTED]@#g' \
     -e 's/AKIA[0-9A-Z]{16}/[REDACTED_AWS_KEY]/g' \
     -e 's/(private key:[[:space:]]*)[^[:space:]].*/\1[REDACTED]/gI' \
     -e 's/(preshared key:[[:space:]]*)[^[:space:]].*/\1[REDACTED]/gI' \
+    -e 's/(Bearer[[:space:]]+)[A-Za-z0-9_.=-]{10,}/\1[REDACTED]/gI' \
+    -e 's/eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}/[REDACTED_JWT]/g' \
     "$src" 2>/dev/null | awk '
       /-----BEGIN [A-Za-z0-9 ]*PRIVATE KEY-----/ { print "[REDACTED PRIVATE KEY BLOCK]"; skip=1; next }
       /-----END [A-Za-z0-9 ]*PRIVATE KEY-----/   { skip=0; next }
