@@ -41,7 +41,21 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 has() { command -v "$1" >/dev/null 2>&1; }
-svc_active() { systemctl is-active "$1" >/dev/null 2>&1; }
+
+# Проверка "сервис запущен" с деградацией по init-системам:
+# systemd -> OpenRC -> SysV service -> просто по имени процесса.
+svc_active() {
+  local name="$1"
+  if has systemctl; then
+    systemctl is-active "$name" >/dev/null 2>&1
+  elif has rc-service; then
+    rc-service "$name" status 2>/dev/null | grep -q started
+  elif has service; then
+    service "$name" status >/dev/null 2>&1
+  else
+    pgrep -x "$name" >/dev/null 2>&1
+  fi
+}
 sep() { echo; echo "===================================================="; echo "## $1"; echo "===================================================="; }
 
 # Выполняет команду, переданную одной строкой (могут быть пайпы/редиректы).
@@ -75,18 +89,40 @@ echo "SERVER AUDIT REPORT"
 echo "Host: $(hostname)   Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 echo "===================================================="
 
-# ---------- 1. ОС / ANKETA / LOAD ----------
-sep "OS / UPTIME / LOAD"
-run "cat /etc/os-release | grep -E '^(PRETTY_NAME|VERSION)='"
+# ---------- 1. ОС / АРХИТЕКТУРА / ВРЕМЯ РАБОТЫ ----------
+sep "OS / UPTIME"
+run "cat /etc/os-release | grep -E '^(PRETTY_NAME|ID|ID_LIKE|VERSION)='"
 run "uname -a"
 run "uptime"
 run "who -r"
+INIT_SYSTEM="unknown"
+if has systemctl; then
+  INIT_SYSTEM="systemd"
+elif has rc-status; then
+  INIT_SYSTEM="OpenRC"
+elif has service; then
+  INIT_SYSTEM="SysV (service)"
+fi
+echo "Init-система: $INIT_SYSTEM"
 
-# ---------- 2. CPU / ПАМЯТЬ / SWAP ----------
-sep "CPU / MEMORY / SWAP"
+# ---------- 2. CPU / ПАМЯТЬ / SWAP / НАГРУЗКА ----------
+sep "CPU / MEMORY / SWAP / LOAD"
 run "nproc"
+run "cat /proc/loadavg"
 run "free -h"
 run "vmstat 1 3"
+if has mpstat; then
+  echo "--- mpstat (per-CPU utilization, 2 samples) ---"
+  mpstat 1 2 2>&1
+  echo
+fi
+if has iostat; then
+  echo "--- iostat (disk I/O, 2 samples) ---"
+  iostat -xz 1 2 2>&1
+  echo
+else
+  echo "(iostat не установлен — пакет sysstat даст более подробную картину диска/CPU)"
+fi
 echo "--- Top-10 by RAM ---"
 ps aux --sort=-%mem | head -n 11
 echo
@@ -106,13 +142,28 @@ sep "OOM KILLER / KERNEL ERRORS (dmesg)"
 run "dmesg -T 2>/dev/null | grep -iE 'oom|out of memory|killed process' | tail -n 30"
 run "dmesg -T 2>/dev/null | grep -iE 'error|fail' | tail -n 30"
 
-# ---------- 5. SYSTEMD: УПАВШИЕ ЮНИТЫ ----------
-sep "SYSTEMD FAILED UNITS"
-run "systemctl --failed --no-pager"
+# ---------- 5. УПАВШИЕ СЕРВИСЫ ----------
+sep "FAILED / STOPPED SERVICES"
+if has systemctl; then
+  run "systemctl --failed --no-pager"
+elif has rc-status; then
+  run "rc-status --servicelist 2>&1 | grep -v started"
+elif has service; then
+  run "service --status-all 2>&1"
+else
+  echo "Не найден systemctl/rc-status/service — пропущено."
+fi
 
 # ---------- 6. ЖУРНАЛ ОШИБОК ЗА 24Ч ----------
-sep "JOURNALCTL ERRORS (last 24h, priority err+)"
-run "journalctl -p err -S -24h --no-pager | tail -n 100"
+sep "ERROR LOG (last 24h, priority err+)"
+if has journalctl; then
+  run "journalctl -p err -S -24h --no-pager | tail -n 100"
+else
+  echo "journalctl недоступен (система без systemd) — общие системные ошибки см. в разделе OOM/dmesg выше и в /var/log/messages или /var/log/syslog."
+  for f in /var/log/syslog /var/log/messages; do
+    [ -f "$f" ] && { echo "--- tail $f (errors) ---"; grep -iE 'error|fail|critical' "$f" | tail -n 100; }
+  done
+fi
 
 # ---------- 7. СЕТЬ ----------
 sep "NETWORK — INTERFACES / ROUTES / DNS"
@@ -251,17 +302,72 @@ if has apache2 || has httpd; then
   done
 fi
 
-# ---------- 10. PHP-FPM ----------
-if has php || systemctl list-units --type=service 2>/dev/null | grep -q php.*fpm; then
+# ---------- 10. ДОМЕНЫ / DNS ----------
+sep "DOMAINS — DNS POINTING TO THIS SERVER"
+if [ "${SKIP_NET:-0}" != "1" ]; then
+  SERVER_PUBLIC_IP=""
+  if has curl; then
+    SERVER_PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || true)
+    [ -z "$SERVER_PUBLIC_IP" ] && SERVER_PUBLIC_IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null || true)
+  fi
+  echo "Внешний IP сервера (определён автоматически): ${SERVER_PUBLIC_IP:-не удалось определить}"
+  echo
+
+  DOMAINS=""
+  if has nginx; then
+    DOMAINS="$DOMAINS $(nginx -T 2>/dev/null | grep -E '^\s*server_name\s' | sed -E 's/^\s*server_name\s+//; s/;\s*$//' | tr ' ' '\n')"
+  fi
+  if has apache2ctl || has apachectl; then
+    AC=$(has apache2ctl && echo apache2ctl || echo apachectl)
+    DOMAINS="$DOMAINS $($AC -S 2>/dev/null | grep -oE 'namevhost [^ ]+' | awk '{print $2}')"
+    DOMAINS="$DOMAINS $(grep -rhoE '^\s*ServerAlias\s+.*' /etc/apache2/sites-enabled /etc/httpd/conf.d 2>/dev/null | sed -E 's/^\s*ServerAlias\s+//')"
+  fi
+  DOMAINS=$(printf '%s\n' $DOMAINS | sed '/^$/d' | grep -vE '^(_|\*|localhost)$' | sort -u)
+
+  if [ -n "$DOMAINS" ]; then
+    echo "Найдено доменов в конфигах веб-сервера: $(printf '%s\n' "$DOMAINS" | wc -l)"
+    echo "(если домен идёт через Cloudflare/другой CDN/прокси — несовпадение IP это нормально, не ошибка)"
+    echo
+    printf '%-35s %-18s %s\n' "DOMAIN" "A-RECORD" "STATUS"
+    printf '%s\n' "$DOMAINS" | while IFS= read -r d; do
+      [ -z "$d" ] && continue
+      if has dig; then
+        resolved=$(dig +short A "$d" 2>/dev/null | tail -n1)
+      elif has getent; then
+        resolved=$(getent hosts "$d" 2>/dev/null | awk '{print $1}' | tail -n1)
+      else
+        resolved=""
+      fi
+      if [ -z "$resolved" ]; then
+        status="нет A-записи / NXDOMAIN"
+      elif [ -n "$SERVER_PUBLIC_IP" ] && [ "$resolved" = "$SERVER_PUBLIC_IP" ]; then
+        status="OK -> указывает на этот сервер"
+      else
+        status="указывает на $resolved (не совпадает с этим сервером)"
+      fi
+      printf '%-35s %-18s %s\n' "$d" "${resolved:--}" "$status"
+    done
+  else
+    echo "Домены в конфигах nginx/apache не найдены (server_name/ServerName не заданы или веб-сервер не установлен)."
+  fi
+else
+  echo "Пропущено (SKIP_NET=1)"
+fi
+
+# ---------- 11. PHP-FPM ----------
+PHP_FPM_UNITS=""
+has systemctl && PHP_FPM_UNITS=$(systemctl list-units --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -i 'php.*fpm')
+if has php || [ -n "$PHP_FPM_UNITS" ]; then
   sep "PHP-FPM"
   run "php -v 2>/dev/null | head -n1"
-  for u in $(systemctl list-units --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -i 'php.*fpm'); do
+  for u in $PHP_FPM_UNITS; do
     echo "--- $u ---"
     svc_active "$u" && echo "status: active" || echo "status: NOT active"
   done
+  [ -z "$PHP_FPM_UNITS" ] && svc_active php-fpm && echo "php-fpm: active"
 fi
 
-# ---------- 11. БАЗЫ ДАННЫХ ----------
+# ---------- 12. БАЗЫ ДАННЫХ ----------
 sep "DATABASES"
 if has mysql || has mariadb; then
   echo "--- MySQL/MariaDB ---"
@@ -289,7 +395,7 @@ if has mongod; then
   svc_active mongod && echo "status: active"
 fi
 
-# ---------- 12. DOCKER ----------
+# ---------- 13. DOCKER ----------
 if has docker; then
   sep "DOCKER"
   run "docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
@@ -302,13 +408,13 @@ if has docker; then
   run "docker system df"
 fi
 
-# ---------- 13. SSL-СЕРТИФИКАТЫ ----------
+# ---------- 14. SSL-СЕРТИФИКАТЫ ----------
 if has certbot; then
   sep "SSL CERTIFICATES (certbot)"
   run "certbot certificates 2>&1"
 fi
 
-# ---------- 14. WIREGUARD / ПРОКСИ ----------
+# ---------- 15. WIREGUARD / ПРОКСИ ----------
 if has wg; then
   sep "WIREGUARD"
   # `wg show` по умолчанию маскирует приватный/preshared ключ строкой "(hidden)";
@@ -320,7 +426,7 @@ if has docker && docker ps --format '{{.Names}}' 2>/dev/null | grep -qiE 'mtprox
   docker ps --format '{{.Names}}\t{{.Status}}' | grep -iE 'mtproxy|3x-ui|hysteria|teamspeak'
 fi
 
-# ---------- 15. CRON ----------
+# ---------- 16. CRON ----------
 sep "CRON JOBS (root)"
 run "crontab -l 2>&1"
 
