@@ -538,10 +538,23 @@ if [ "${PASTE:-0}" = "1" ]; then
     echo "[*] PASTE=1: заливаю отчёт на termbin.com (публичная ссылка, БЕЗ пароля)..."
     PASTE_URL=$(cat "$FINAL" | nc termbin.com 9999 2>/dev/null | tr -d '\0' | tr -d '[:space:]' | tail -c 200)
     if [ -n "$PASTE_URL" ]; then
+      PASTE_SLUG="${PASTE_URL##*/}"
       echo "Ссылка: $PASTE_URL"
       echo "[!] Ссылка ПУБЛИЧНАЯ и без пароля — открыть её сможет кто угодно, у кого"
       echo "    она окажется. Пароли/токены/ключи из отчёта уже вырезаны, но хостнеймы,"
       echo "    IP и список софта останутся видны. Не используйте для чувствительных серверов."
+      if has curl; then
+        echo "Удалить ссылку можно (работает первые 10 минут с этого же IP):"
+        echo "  curl -X POST \"https://termbin.com/delete?slug=$PASTE_SLUG\""
+        if [ -n "${PASTE_TTL:-}" ] && [ "${PASTE_TTL:-0}" -gt 0 ] 2>/dev/null; then
+          echo "[*] PASTE_TTL=$PASTE_TTL: удалю ссылку сама через $PASTE_TTL сек. Успейте скопировать/открыть."
+          ( sleep "$PASTE_TTL"
+            DEL=$(curl -s -X POST "https://termbin.com/delete?slug=$PASTE_SLUG")
+            echo "[*] termbin: $DEL" >&3
+          ) &
+          disown
+        fi
+      fi
     else
       echo "[!] Не удалось залить на termbin.com (нет сети или сервис недоступен) — используйте текст выше."
     fi
