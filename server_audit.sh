@@ -96,6 +96,39 @@ echo "SERVER AUDIT REPORT"
 echo "Host: $(hostname)   Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 echo "===================================================="
 
+# ---------- 0. СВОДКА: ЧТО НАЙДЕНО НА СЕРВЕРЕ ----------
+sep "СВОДКА — что установлено (без подробностей, см. разделы ниже)"
+yn() { [ "$2" = "1" ] && echo "  [x] $1" || echo "  [ ] $1"; }
+has_dir_or_cmd() { [ -d "$1" ] && return 0; [ -n "${2:-}" ] && has "$2"; }
+
+echo "Панели управления:"
+yn "HestiaCP"    "$([ -d /usr/local/hestia ] && echo 1 || echo 0)"
+yn "ISPmanager"  "$([ -d /usr/local/mgr5 ] && echo 1 || echo 0)"
+yn "FastPanel"   "$([ -d /usr/local/fastpanel2 ] && echo 1 || echo 0)"
+yn "DirectAdmin" "$([ -d /usr/local/directadmin ] && echo 1 || echo 0)"
+yn "aaPanel"     "$([ -d /www/server/panel ] && echo 1 || echo 0)"
+yn "VestaCP"     "$([ -d /usr/local/vesta ] && echo 1 || echo 0)"
+yn "Plesk"       "$([ -d /usr/local/psa ] && echo 1 || echo 0)"
+yn "cPanel/WHM"  "$([ -d /usr/local/cpanel ] && echo 1 || echo 0)"
+echo "Веб-серверы / рантаймы:"
+yn "nginx"    "$(has nginx && echo 1 || echo 0)"
+yn "apache"   "$( (has apache2 || has httpd) && echo 1 || echo 0)"
+yn "PHP"      "$(has php && echo 1 || echo 0)"
+yn "PM2 (Node.js)" "$(has pm2 && echo 1 || echo 0)"
+echo "Базы данных:"
+yn "MySQL/MariaDB" "$( (has mysql || has mariadb) && echo 1 || echo 0)"
+yn "PostgreSQL"    "$(has psql && echo 1 || echo 0)"
+yn "Redis"         "$(has redis-cli && echo 1 || echo 0)"
+yn "MongoDB"       "$(has mongod && echo 1 || echo 0)"
+echo "Инфраструктура:"
+yn "Docker"      "$(has docker && echo 1 || echo 0)"
+yn "WireGuard"   "$(has wg && echo 1 || echo 0)"
+yn "certbot (SSL)" "$(has certbot && echo 1 || echo 0)"
+yn "fail2ban"    "$(has fail2ban-client && echo 1 || echo 0)"
+yn "ufw"         "$(has ufw && echo 1 || echo 0)"
+yn "firewalld"   "$(has firewall-cmd && echo 1 || echo 0)"
+echo "Подробности по каждому пункту — в соответствующих разделах ниже."
+
 # ---------- 1. ОС / АРХИТЕКТУРА / ВРЕМЯ РАБОТЫ ----------
 sep "OS / UPTIME"
 run "cat /etc/os-release | grep -E '^(PRETTY_NAME|ID|ID_LIKE|VERSION)='"
@@ -112,10 +145,60 @@ elif has service; then
 fi
 echo "Init-система: $INIT_SYSTEM"
 
+echo "--- Синхронизация времени ---"
+if has timedatectl; then
+  run "timedatectl status 2>&1 | grep -iE 'local time|time zone|ntp|synchroni'"
+elif has chronyc; then
+  run "chronyc tracking 2>&1 | head -n 10"
+elif has ntpq; then
+  run "ntpq -p 2>&1 | head -n 10"
+else
+  echo "Нет timedatectl/chronyc/ntpq — проверить синхронизацию времени не удалось."
+fi
+
+echo "--- Требуется ли перезагрузка ---"
+if [ -f /var/run/reboot-required ]; then
+  echo "[!] ТРЕБУЕТСЯ ПЕРЕЗАГРУЗКА (обновлялось ядро/системные библиотеки)"
+  [ -f /var/run/reboot-required.pkgs ] && { echo "Пакеты:"; cat /var/run/reboot-required.pkgs; }
+elif has needs-restarting; then
+  if needs-restarting -r >/dev/null 2>&1; then
+    echo "Перезагрузка не требуется (needs-restarting -r)"
+  else
+    echo "[!] ТРЕБУЕТСЯ ПЕРЕЗАГРУЗКА (needs-restarting -r)"
+  fi
+else
+  echo "Не удалось определить (нет /var/run/reboot-required и needs-restarting) — актуально для Debian/Ubuntu и RHEL/CentOS с yum-utils/dnf-utils соответственно."
+fi
+
+echo "--- Обновления пакетов ---"
+if has apt; then
+  UPD_COUNT=$(apt list --upgradable 2>/dev/null | grep -c upgradable || true)
+  echo "apt: доступно обновлений (включая security): $UPD_COUNT"
+elif has dnf; then
+  UPD_COUNT=$(dnf check-update -q 2>/dev/null | grep -cE '^[^ ]+\.' || true)
+  echo "dnf: доступно обновлений: $UPD_COUNT"
+elif has yum; then
+  UPD_COUNT=$(yum check-update -q 2>/dev/null | grep -cE '^[^ ]+\.' || true)
+  echo "yum: доступно обновлений: $UPD_COUNT"
+elif has apk; then
+  run "apk version -l '<' 2>/dev/null | head -n 20"
+else
+  echo "Не найден apt/dnf/yum/apk — пропущено."
+fi
+
 # ---------- 2. CPU / ПАМЯТЬ / SWAP / НАГРУЗКА ----------
 sep "CPU / MEMORY / SWAP / LOAD"
 run "nproc"
 run "cat /proc/loadavg"
+
+echo "--- Лимит открытых файлов (ulimit -n) ---"
+ULIMIT_N=$(ulimit -n 2>/dev/null || echo "?")
+echo "Текущий процесс: $ULIMIT_N"
+if [ "$ULIMIT_N" != "?" ] && [ "$ULIMIT_N" != "unlimited" ] && [ "$ULIMIT_N" -lt 4096 ] 2>/dev/null; then
+  echo "[!] ВНИМАНИЕ: лимит открытых файлов низкий (< 4096) — частая причина"
+  echo "    ошибок вида 'too many open files' у nginx/докер-контейнеров под нагрузкой."
+fi
+
 run "free -h"
 
 echo "--- Memory usage summary ---"
@@ -162,6 +245,15 @@ echo
 # ---------- 3. ДИСК / INODE / LVM ----------
 sep "DISK / INODES"
 run "df -hT"
+
+echo "--- Занятость диска (предупреждение при >= 90%) ---"
+df -P 2>/dev/null | awk 'NR>1 && $1 !~ /^(tmpfs|devtmpfs|overlay|shm)$/ {
+  pct = $5; sub(/%/, "", pct);
+  printf "%-6s%% %-20s %s\n", pct, $6, $1
+  if (pct+0 >= 90) print "[!] ВНИМАНИЕ: " $6 " занято на " pct "% (" $1 ")"
+}'
+echo
+
 run "df -i"
 if has lvs; then run "lvs"; run "vgs"; run "pvs"; fi
 if has lsblk; then run "lsblk -f"; fi
@@ -307,6 +399,8 @@ sep "CONTROL PANELS"
 [ -d /usr/local/directadmin ] && { echo "DirectAdmin найдена"; svc_active directadmin && echo "directadmin: active"; }
 [ -d /www/server/panel ] && echo "aaPanel найдена"
 [ -d /usr/local/vesta ] && echo "VestaCP найдена"
+[ -d /usr/local/psa ] && { echo "Plesk найдена:"; run "plesk version 2>/dev/null | head -n 5"; }
+[ -d /usr/local/cpanel ] && { echo "cPanel/WHM найдена:"; run "cat /usr/local/cpanel/version 2>/dev/null"; }
 echo
 
 # ---------- 9. ВЕБ-СЕРВЕРЫ ----------
@@ -385,10 +479,12 @@ else
   echo "Пропущено (SKIP_NET=1)"
 fi
 
-# ---------- 11. PHP-FPM ----------
+# ---------- 11. PHP-FPM: ВЕРСИИ / ЛИМИТЫ / ПУЛЫ (САЙТЫ) ----------
 PHP_FPM_UNITS=""
 has systemctl && PHP_FPM_UNITS=$(systemctl list-units --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -i 'php.*fpm')
-if has php || [ -n "$PHP_FPM_UNITS" ]; then
+PHP_INI_KEYS='^(memory_limit|upload_max_filesize|post_max_size|max_execution_time|max_input_time|max_input_vars|opcache\.enable|opcache\.memory_consumption|display_errors|expose_php)[[:space:]]*='
+
+if has php || [ -n "$PHP_FPM_UNITS" ] || [ -d /etc/php ] || [ -d /etc/php-fpm.d ]; then
   sep "PHP-FPM"
   run "php -v 2>/dev/null | head -n1"
   for u in $PHP_FPM_UNITS; do
@@ -396,6 +492,64 @@ if has php || [ -n "$PHP_FPM_UNITS" ]; then
     svc_active "$u" && echo "status: active" || echo "status: NOT active"
   done
   [ -z "$PHP_FPM_UNITS" ] && svc_active php-fpm && echo "php-fpm: active"
+  echo
+
+  # Debian/Ubuntu-раскладка (Hestia/ISPmanager/FastPanel/VestaCP/DirectAdmin
+  # на них обычно и живут): /etc/php/<версия>/fpm/, отдельная версия на сайт.
+  PHP_VERSIONS=""
+  [ -d /etc/php ] && PHP_VERSIONS=$(find /etc/php -mindepth 1 -maxdepth 1 -type d 2>/dev/null | xargs -n1 basename 2>/dev/null | sort -V)
+
+  if [ -n "$PHP_VERSIONS" ]; then
+    for v in $PHP_VERSIONS; do
+      echo "--- PHP $v: лимиты и оптимизация ---"
+      FPM_BIN=""
+      for cand in "php-fpm$v" "php$v-fpm" "/usr/sbin/php-fpm$v"; do
+        has "$cand" && { FPM_BIN="$cand"; break; }
+      done
+      if [ -n "$FPM_BIN" ]; then
+        run "$FPM_BIN -i 2>/dev/null | grep -iE \"$PHP_INI_KEYS\""
+      elif [ -f "/etc/php/$v/fpm/php.ini" ]; then
+        run "grep -iE \"$PHP_INI_KEYS\" '/etc/php/$v/fpm/php.ini'"
+      else
+        echo "(не удалось определить: нет бинаря fpm и файла php.ini для этой версии)"
+      fi
+      POOLDIR="/etc/php/$v/fpm/pool.d"
+      if [ -d "$POOLDIR" ]; then
+        POOLS=$(find "$POOLDIR" -maxdepth 1 -name '*.conf' 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.conf$//')
+        if [ -n "$POOLS" ]; then
+          echo "Сайты/пулы на PHP $v:"
+          printf '%s\n' "$POOLS" | sed 's/^/  - /'
+        fi
+      fi
+      echo
+    done
+  elif [ -d /etc/php-fpm.d ]; then
+    # RHEL/CentOS-раскладка: обычно одна версия PHP на систему.
+    echo "--- PHP: лимиты и оптимизация (RHEL/CentOS layout) ---"
+    if has php-fpm; then
+      run "php-fpm -i 2>/dev/null | grep -iE \"$PHP_INI_KEYS\""
+    else
+      PHPINI=$(php --ini 2>/dev/null | grep 'Loaded Configuration' | awk '{print $NF}')
+      [ -n "$PHPINI" ] && run "grep -iE \"$PHP_INI_KEYS\" '$PHPINI'"
+    fi
+    POOLS=$(find /etc/php-fpm.d -maxdepth 1 -name '*.conf' 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.conf$//')
+    if [ -n "$POOLS" ]; then
+      echo "Сайты/пулы:"
+      printf '%s\n' "$POOLS" | sed 's/^/  - /'
+    fi
+  elif has php; then
+    echo "Несколько версий PHP не обнаружено, показываю CLI php.ini:"
+    PHPINI=$(php --ini 2>/dev/null | grep 'Loaded Configuration' | awk '{print $NF}')
+    [ -n "$PHPINI" ] && run "grep -iE \"$PHP_INI_KEYS\" '$PHPINI'"
+  fi
+fi
+
+# ---------- 11b. PM2 (Node.js) ----------
+if has pm2; then
+  sep "PM2 (Node.js process manager)"
+  echo "(если приложения запущены под другим пользователем, а скрипт — под root,"
+  echo " pm2 может показать пустой список — это ограничение pm2, не ошибка)"
+  run "pm2 list 2>&1"
 fi
 
 # ---------- 12. БАЗЫ ДАННЫХ ----------

@@ -45,21 +45,36 @@ sudo bash server_audit.sh
 
 ## Что проверяется
 
-- ОС, дистрибутив, init-система, uptime, load average
-- CPU / память / swap, `iostat`/`mpstat` (если установлен `sysstat`), топ
-  процессов по RAM и CPU
-- Диск, inode, LVM
+- **Сводка вверху отчёта**: чек-лист из одного взгляда — что вообще
+  установлено на сервере (панели, веб-серверы, БД, Docker, WireGuard,
+  fail2ban, firewall и т.д.), без подробностей — подробности ниже, по разделам.
+- ОС, дистрибутив, init-система, uptime, load average, синхронизация времени
+  (timedatectl/chronyc/ntpq), требуется ли перезагрузка, число доступных
+  обновлений пакетов (apt/dnf/yum/apk)
+- CPU / память / swap (в т.ч. лимит открытых файлов, `ulimit -n` — частая
+  причина "too many open files" под нагрузкой), `iostat`/`mpstat` (если
+  установлен `sysstat`), топ процессов по RAM и CPU
+- Диск, inode, LVM, процент занятости каждого раздела с предупреждением при
+  ≥ 90%
 - OOM killer и ошибки ядра (dmesg)
 - Упавшие сервисы (systemd / OpenRC / SysV — в зависимости от того, что есть
   на сервере), лог ошибок за 24ч (journalctl или syslog/messages)
 - Сеть: интерфейсы, маршруты, DNS, ping/traceroute/HTTPS-исходящий трафик,
   открытые порты, firewall (ufw/iptables/nftables/firewalld)
 - SSH: статус, конфиг, активные сессии, попытки логина, fail2ban
-- Панели управления (HestiaCP, ISPmanager, FastPanel, DirectAdmin, aaPanel, VestaCP)
+- Панели управления: HestiaCP, ISPmanager, FastPanel, DirectAdmin, aaPanel,
+  VestaCP, Plesk, cPanel/WHM
 - nginx / apache
 - **Домены**: список доменов из конфигов nginx/apache + сверка их A-записей
   с внешним IP сервера (указывает ли DNS домена реально на этот сервер)
-- PHP-FPM
+- **PHP**: все установленные версии (Debian/Ubuntu multi-version layout —
+  как обычно и разворачивают панели — или единая версия RHEL/CentOS),
+  для каждой версии — лимиты и оптимизация (`memory_limit`,
+  `upload_max_filesize`, `post_max_size`, `max_execution_time`,
+  `opcache.enable`/`memory_consumption` и т.д.), и список сайтов/пулов
+  (`pool.d`), которые на этой версии работают. Если сайтов/PHP нет —
+  раздел не выводится вовсе.
+- PM2 (Node.js), если используется
 - MySQL/MariaDB, PostgreSQL, Redis, MongoDB
 - Docker: контейнеры, логи падающих/unhealthy контейнеров
 - SSL-сертификаты (certbot)
