@@ -110,6 +110,28 @@ sep "CPU / MEMORY / SWAP / LOAD"
 run "nproc"
 run "cat /proc/loadavg"
 run "free -h"
+
+echo "--- Memory usage summary ---"
+read -r MTOTAL MUSED MFREE MSHARED MBUFF MAVAIL <<EOF
+$(free -m | awk '/^Mem:/ {print $2, $3, $4, $5, $6, $7}')
+EOF
+if [ -n "${MTOTAL:-}" ] && [ "$MTOTAL" -gt 0 ]; then
+  MUSED_PCT=$((MUSED * 100 / MTOTAL))
+  echo "RAM: занято ${MUSED_PCT}% (${MUSED} MiB из ${MTOTAL} MiB), свободно ${MFREE} MiB, доступно (available) ${MAVAIL:-?} MiB"
+  [ "$MUSED_PCT" -ge 90 ] && echo "[!] ВНИМАНИЕ: занято >= 90% RAM"
+fi
+read -r STOTAL SUSED SFREE <<EOF
+$(free -m | awk '/^Swap:/ {print $2, $3, $4}')
+EOF
+if [ -n "${STOTAL:-}" ] && [ "$STOTAL" -gt 0 ]; then
+  SUSED_PCT=$((SUSED * 100 / STOTAL))
+  echo "Swap: занято ${SUSED_PCT}% (${SUSED} MiB из ${STOTAL} MiB)"
+  [ "$SUSED_PCT" -ge 50 ] && echo "[!] ВНИМАНИЕ: активно используется swap (>= 50%) — возможна нехватка RAM"
+else
+  echo "Swap: не настроен (0 MiB)"
+fi
+echo
+
 run "vmstat 1 3"
 if has mpstat; then
   echo "--- mpstat (per-CPU utilization, 2 samples) ---"
