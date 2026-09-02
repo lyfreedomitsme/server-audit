@@ -523,4 +523,29 @@ echo "                     вниз до конца — текст копиру�
 echo "                     (правый клик мыши — вставить)."
 echo "  Windows Terminal:  выделите текст мышью, затем Ctrl+Shift+C."
 echo "  macOS Terminal/iTerm2: выделите текст мышью, затем Cmd+C."
+echo
+echo "Если терминал всё равно обрезает верх отчёта (маленький буфер прокрутки"
+echo "в PuTTY/MobaXterm/Termius) — самый надёжный способ получить отчёт целиком:"
+echo "запустите эту же команду с ЛОКАЛЬНОГО терминала (не внутри сессии на"
+echo "сервере) с перенаправлением в файл на своём компьютере, например:"
+echo "  ssh root@${SERVER_PUBLIC_IP:-IP_СЕРВЕРА} 'curl -fsSL https://raw.githubusercontent.com/lyfreedomitsme/server-audit/main/server_audit.sh | bash' > report.txt"
+echo "Файл report.txt появится у вас на компьютере целиком, без обрезаний."
 echo "===================================================="
+
+if [ "${PASTE:-0}" = "1" ]; then
+  echo
+  if has nc; then
+    echo "[*] PASTE=1: заливаю отчёт на termbin.com (публичная ссылка, БЕЗ пароля)..."
+    PASTE_URL=$(cat "$FINAL" | nc termbin.com 9999 2>/dev/null | tr -d '\0' | tr -d '[:space:]' | tail -c 200)
+    if [ -n "$PASTE_URL" ]; then
+      echo "Ссылка: $PASTE_URL"
+      echo "[!] Ссылка ПУБЛИЧНАЯ и без пароля — открыть её сможет кто угодно, у кого"
+      echo "    она окажется. Пароли/токены/ключи из отчёта уже вырезаны, но хостнеймы,"
+      echo "    IP и список софта останутся видны. Не используйте для чувствительных серверов."
+    else
+      echo "[!] Не удалось залить на termbin.com (нет сети или сервис недоступен) — используйте текст выше."
+    fi
+  else
+    echo "[!] PASTE=1 запрошен, но netcat (nc) не установлен — пропущено."
+  fi
+fi
