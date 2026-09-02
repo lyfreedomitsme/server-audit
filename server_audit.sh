@@ -425,15 +425,32 @@ if has mongod; then
 fi
 
 # ---------- 13. DOCKER ----------
+# Логи падающих контейнеров жёстко ограничены по объёму: если сервер уходит
+# в каскадный краш-луп (много контейнеров рестартует одновременно), отчёт
+# всё равно не должен раздуваться на тысячи строк и обрываться в терминале.
+DOCKER_LOG_MAX_CONTAINERS=8
+DOCKER_LOG_TAIL_LINES=15
 if has docker; then
   sep "DOCKER"
-  run "docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
-  echo "--- Restarting/unhealthy containers logs (last 20 lines each) ---"
-  for c in $(docker ps -a --filter "status=restarting" --format '{{.Names}}') $(docker ps --filter "health=unhealthy" --format '{{.Names}}'); do
-    echo "[$c]"
-    docker logs --tail 20 "$c" 2>&1
-    echo
-  done
+  run "docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | head -n 60"
+  echo "--- Restarting/unhealthy containers logs (до $DOCKER_LOG_MAX_CONTAINERS контейнеров, последние $DOCKER_LOG_TAIL_LINES строк каждый) ---"
+  PROBLEM_CONTAINERS=$( { docker ps -a --filter "status=restarting" --format '{{.Names}}'; docker ps --filter "health=unhealthy" --format '{{.Names}}'; } 2>/dev/null | sed '/^$/d' | sort -u)
+  PROBLEM_TOTAL=$(printf '%s\n' "$PROBLEM_CONTAINERS" | grep -c . || true)
+  if [ "$PROBLEM_TOTAL" -gt 0 ]; then
+    printf '%s\n' "$PROBLEM_CONTAINERS" | head -n "$DOCKER_LOG_MAX_CONTAINERS" | while IFS= read -r c; do
+      [ -z "$c" ] && continue
+      echo "[$c]"
+      # uniq схлопывает подряд идущие ПОЛНОСТЬЮ одинаковые строки — не спасает
+      # от спама с разными таймстампами, но границу по числу строк держит tail.
+      docker logs --tail "$DOCKER_LOG_TAIL_LINES" "$c" 2>&1 | uniq
+      echo
+    done
+    if [ "$PROBLEM_TOTAL" -gt "$DOCKER_LOG_MAX_CONTAINERS" ]; then
+      echo "... и ещё $((PROBLEM_TOTAL - DOCKER_LOG_MAX_CONTAINERS)) проблемных контейнер(ов) — логи не показаны, чтобы не раздувать отчёт. Проверьте вручную: docker logs <имя>"
+    fi
+  else
+    echo "Нет контейнеров в состоянии restarting/unhealthy."
+  fi
   run "docker system df"
 fi
 
@@ -475,6 +492,23 @@ trap cleanup EXIT
 
 main_audit > "$RAW" 2>&1
 
+# Общий предохранитель: если сервер (например, из-за каскадного краш-лупа
+# сервисов) выдал аномально много данных, отчёт всё равно не должен
+# раздуваться бесконечно и обрываться в терминале пользователя.
+MAX_REPORT_LINES=3000
+RAW_LINES=$(wc -l < "$RAW" 2>/dev/null || echo 0)
+if [ "$RAW_LINES" -gt "$MAX_REPORT_LINES" ]; then
+  TRUNCATED=$(head -n "$MAX_REPORT_LINES" "$RAW")
+  {
+    printf '%s\n' "$TRUNCATED"
+    echo
+    echo "[!] ОТЧЁТ ОБРЕЗАН: собрано $RAW_LINES строк, показаны первые $MAX_REPORT_LINES."
+    echo "    Сервер выдаёт аномально много диагностических данных — это само по"
+    echo "    себе симптом (часто: каскадный краш-луп сервисов, спам в логах)."
+    echo "    Часть проверок ниже в отчёт не попала."
+  } > "$RAW"
+fi
+
 redact_file "$RAW" "$FINAL"
 
 echo
@@ -483,6 +517,10 @@ echo "ГОТОВЫЙ ОТЧЁТ — скопируйте всё, что ниже
 echo "===================================================="
 cat "$FINAL"
 echo "===================================================="
-echo "Конец отчёта. На диске сервера ничего не сохранено — это единственная копия,"
-echo "она была только что выведена в этот терминал."
+echo "Конец отчёта. Как скопировать всё, что выше:"
+echo "  PuTTY:            зажмите ЛКМ в начале отчёта и, не отпуская, потяните"
+echo "                     вниз до конца — текст копируется сам, без Ctrl+C"
+echo "                     (правый клик мыши — вставить)."
+echo "  Windows Terminal:  выделите текст мышью, затем Ctrl+Shift+C."
+echo "  macOS Terminal/iTerm2: выделите текст мышью, затем Cmd+C."
 echo "===================================================="
