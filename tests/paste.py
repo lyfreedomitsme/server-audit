@@ -165,7 +165,7 @@ sys.exit(28 if code=='000' else 0)
     result,_,_=interactive("y",{"PASTE_MAX_BYTES":"4096","PASTE_TTL":"1"})
     payload=upload.read_text()
     assert len(payload.encode())<=4096 and "[COMPACT TERMBIN REPORT]" in payload
-    assert "HTTP 502" in payload and "Out of memory" in payload
+    assert "HTTP_SITE example.test FRONT_https=502" in payload and "Out of memory" in payload
     assert "КОМПАКТНАЯ" in result and len(event_list())==2
     reset()
     run=subprocess.run(["bash",str(script)],env=base|{"PASTE":"1","PASTE_MODE":"full","PASTE_MAX_BYTES":"4096"},capture_output=True,timeout=5)

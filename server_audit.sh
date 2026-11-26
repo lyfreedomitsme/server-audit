@@ -960,7 +960,7 @@ audit_access_sample() {
 
 main_audit() {
 audit_detect
-echo "SERVER AUDIT REPORT v3.1"
+echo "SERVER AUDIT REPORT v3.2"
 echo "History: last $AUDIT_HISTORY_DAYS days, current and previous retained boot; target: ${AUDIT_DOMAIN:-auto}"
 echo "Host: $(hostname)   Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 echo "===================================================="
@@ -1655,56 +1655,202 @@ paste_prepare() {
       return 1
     }
     function section_weight(h) {
-      if(h ~ /WEB STACK|WEB \/ PHP \/ DB ERROR|BOOT HISTORY|SERVICES \/ AUTOSTART|CHANGE EVIDENCE/)return 4
-      if(h ~ /TRAFFIC|STORAGE|PHP POOLS|DISK|CPU \/ MEMORY|DATABASES|DOMAINS/)return 3
+      if(h ~ /TRAFFIC/)return 11
+      if(h ~ /WEB STACK/)return 9
+      if(h ~ /SERVICES \/ AUTOSTART/)return 7
+      if(h ~ /WEB \/ PHP \/ DB ERROR|BOOT HISTORY/)return 5
+      if(h ~ /CHANGE EVIDENCE|STORAGE|PHP POOLS|CPU \/ MEMORY|DATABASES/)return 3
+      if(h ~ /DISK|DOMAINS|LOCAL PORTS/)return 2
       return 1
+    }
+    function add(t, forced, i) {
+      if(t=="")return
+      i=++n[section]; line[section,i]=t
+      rank[section,i]=(forced?forced:priority(t))
+      if(target!="" && index(tolower(t),tolower(target)) && rank[section,i]<8)rank[section,i]=8
+      if(i<=3 && rank[section,i]<3)rank[section,i]=3
+    }
+    function flush_service() {
+      if(svc!="" && svc_fields!="")add("SERVICE " svc svc_fields,9)
+      svc=""; svc_fields=""; life=""
+    }
+    function flush_traffic(  basic,detail) {
+      if(logname=="")return
+      # Do not detach the counters from their source logfile/time window.
+      basic="TRAFFIC " logname " " sample
+      if(http!="")basic=basic " http=" http
+      if(endpoints!="")basic=basic " endpoints=" endpoints
+      if(peak!="")basic=basic " peak=" peak
+      if(botua!="")basic=basic " ua=" botua
+      if(firstip!="")basic=basic " top=" firstip
+      if(errorip!="" && errorip!=firstip)basic=basic " worst_sampled_errors=" errorip
+      add(basic,9)
+      detail="TRAFFIC_DETAIL " logname
+      if(ua!="")detail=detail " ua=" ua
+      if(topip!="")detail=detail " top=" topip
+      if(errorip!="")detail=detail " worst_sampled_errors=" errorip
+      if(ua!=""||topip!=""||errorip!="")add(detail,7)
+      logname="";sample="";http="";endpoints="";peak="";ua="";botua="";firstip="";topip="";ipnum=0;errmax=0;errorip=""
+    }
+    function add_http(t, a,d,scheme,type,port,code,timing,status,key,part) {
+      split(t,a,/[[:space:]]+/)
+      type=a[1]; d=a[2]; scheme=(d ~ /^https:\/\//?"https":"http")
+      sub(/^https?:\/\//,"",d);sub(/\/.*/,"",d)
+      if(d=="")return 0
+      if(!(d in hostseen)){hostseen[d]=++hostcount;hostname[hostcount]=d}
+      key=type "_" scheme
+      if(type=="BACKEND" && a[3]=="via"){port=a[4];sub(/^.*:/,"",port);key=key ":" port}
+      code="UNKNOWN"
+      if(match(t,/HTTP [0-9][0-9][0-9]/))code=substr(t,RSTART+5,3)
+      if(t ~ /NO MATCHING LISTENER|NO LOCAL LISTENER/)code="NO_LISTENER"
+      else if(t ~ /TIMEOUT|timed out|curl: \(28\)/)code=code "/TIMEOUT"
+      else if(t ~ /CONNECT FAILURE|Connection refused|curl: \(7\)/)code=code "/CONNECT_FAILURE"
+      else if(t ~ /TLS FAILURE/)code=code "/TLS_FAILURE"
+      else if(t ~ /DNS FAILURE/)code=code "/DNS_FAILURE"
+      if(match(t,/total=[0-9.]+s/))code=code "/" sprintf("%.3fs",substr(t,RSTART+6,RLENGTH-7)+0)
+      part=key "=" code
+      probes[d]=probes[d] (probes[d]!=""?",":"") part
+      if(code ~ /^(000|5[0-9][0-9]|NO_LISTENER)|FAILURE|TIMEOUT/)hostbad[d]=1
+      return 1
+    }
+    function flush_http(  i,d) {
+      # Error/target hosts before the ordinary successful responses.
+      for(i=1;i<=hostcount;i++){
+        d=hostname[i]
+        add("HTTP_SITE " d " " probes[d],(hostbad[d] || d==target)?10:9)
+        delete probes[d];delete hostbad[d];delete hostseen[d];delete hostname[i]
+      }
+      hostcount=0
+    }
+    function finish_oom_counts() {
+      if(oom_counting && oom_rows==0)add("OOM_COUNT boot=" boot " no victim counts printed (retained sample)",10)
+      oom_counting=0;oom_rows=0
+    }
+    function finish_section() {
+      finish_oom_counts();flush_service();flush_traffic();flush_http()
+      boot="";error_source="";life=""
     }
     BEGIN {
       section=0; title[0]="## REPORT HEADER"; n[0]=0
+      hostcount=0;svc="";logname="";boot=""
     }
     /^## / && length($0)<160 && section<63 {
+      finish_section()
       section++; title[section]=$0; n[section]=0; next
     }
-    /^[[:space:]]*$/ || /^={8,}$/ { next }
+    /^[[:space:]]*$/ || /^==+$/ { next }
     {
       t=$0
-      # Config directives can contain dozens of aliases on one giant line.
-      # Retain a concise primary name in the compact report instead.
+      if(t ~ /^\[!\] REPORT TRUNCATED:/){add(t,10);next}
+      if(title[section] ~ /SERVICES \/ AUTOSTART/){
+        if(t ~ /^--- [A-Za-z0-9@_.-]+\.service ---$/){
+          flush_service();svc=t;sub(/^--- /,"",svc);sub(/ ---$/,"",svc);next
+        }
+        if(svc!="" && t ~ /^(LoadState|ActiveState|SubState|Result|NRestarts|ExecMainStatus|UnitFileState|ActiveEnterTimestamp|InactiveEnterTimestamp|MemoryCurrent)=/){
+          if(t !~ /=$/){
+            sub(/^LoadState=/,"load=",t);sub(/^ActiveState=/,"active=",t);sub(/^SubState=/,"sub=",t)
+            sub(/^Result=/,"result=",t);sub(/^NRestarts=/,"restarts=",t);sub(/^ExecMainStatus=/,"exit=",t)
+            sub(/^UnitFileState=/,"unit=",t);sub(/^MemoryCurrent=/,"mem=",t)
+            sub(/^ActiveEnterTimestamp=/,"started=",t);sub(/^InactiveEnterTimestamp=/,"stopped=",t)
+            svc_fields=svc_fields " " t
+          }
+          next
+        }
+        if(svc!="" && t ~ /^is-enabled: /){
+          sub(/^is-enabled: /,"",t);svc_fields=svc_fields " is-enabled=" t;next
+        }
+        if(t ~ /^recent lifecycle for /){life=t;add(t,4);next}
+        if(t ~ /^--- /){flush_service()}
+        if(life!="" && t ~ /^[0-9][0-9][0-9][0-9]-/ && t ~ /Starting|Started|Stopping|Stopped|Failed|failed|oom-kill/){
+          add("LIFECYCLE " life " " t,6);next
+        }
+      }
+      if(title[section] ~ /BOOT HISTORY/){
+        if(t ~ /^--- kernel OOM\/errors, boot=/){finish_oom_counts();boot=t;sub(/^.*boot=/,"",boot);sub(/ ---$/,"",boot);oom_counting=0;add(t,5);next}
+        if(t ~ /^OOM kills in retained window/){oom_counting=1;oom_rows=0;add(t,5);next}
+        if(oom_counting && t ~ /^[[:space:]]*[0-9]+[[:space:]]+[^ ]+/){
+          oom_rows++;add("OOM_COUNT boot=" boot " victim=" $2 " kills=" $1,10);next
+        }
+        if(oom_counting && t ~ /^--- /)finish_oom_counts()
+        if(t ~ /Out of memory: Killed process/ && boot!=""){add("OOM_EVENT boot=" boot " " t,6);next}
+        if(t ~ /^(reboot|shutdown)[[:space:]]/ || t ~ /^[[:space:]]*(-1|0)[[:space:]]+[0-9a-f]+[[:space:]]/){add(t,8);next}
+      }
+      if(title[section] ~ /WEB STACK/){
+        if(t ~ /^(FRONT|BACKEND|PUBLIC) https?:\/\//){if(add_http(t))next}
+        if(t ~ /^SITE SUMMARY:/){add(t,10);next}
+        if(t ~ /^SITE [^ ]+ => NOT CHECKED/){add(t,8);next}
+        if(t ~ /=> (NO MATCHING LISTENER|NO UNIX SOCKET|UNIX LISTENER PRESENT|LISTENER PRESENT|SOCKET EXISTS)/){add(t,8);next}
+        if(t ~ /^LISTEN[[:space:]]/){add(t,7);next}
+      }
+      if(title[section] ~ /TRAFFIC \/ BOTS/){
+        if(t ~ /^At most .*not a full traffic census|^IP may be a reverse proxy/){add(t,8);next}
+        if(t ~ /^--- \/.* ---$/){
+          flush_traffic();logname=t;sub(/^--- /,"",logname);sub(/ ---$/,"",logname);next
+        }
+        if(logname!=""){
+          if(t ~ /^parsed=/){sample=t;next}
+          if(t ~ /^STATUS [0-9]/){http=http (http!=""?",":"") $2 ":" $3;next}
+          if(t ~ /^ENDPOINT /){v=t;sub(/^ENDPOINT /,"",v);endpoints=endpoints (endpoints!=""?";":"") v;next}
+          if(t ~ /^UA_CLASS /){
+            v=t;sub(/^UA_CLASS /,"",v);ua=ua (ua!=""?";":"") v
+            if(v ~ /bot|crawler|automation|scanner|empty UA/)botua=botua (botua!=""?";":"") v
+            next
+          }
+          if(t ~ /^IP /){
+            if(++ipnum<=2){v=t;sub(/^IP /,"",v);topip=topip (topip!=""?";":"") v;if(ipnum==1)firstip=v}
+            v=t;sub(/^.*499\/5xx=/,"",v);sub(/\).*$/,"",v)
+            if(v ~ /^[0-9]+$/ && v+0>errmax){errmax=v+0;errorip=t;sub(/^IP /,"",errorip)}
+            next
+          }
+          if(t ~ /^Peak sampled requests\/min:/){peak=t;sub(/^Peak sampled requests\/min: /,"",peak);next}
+          if(t ~ /^--- /)flush_traffic()
+        }
+      }
+      if(title[section] ~ /WEB \/ PHP \/ DB ERROR/){
+        if(t ~ /^--- \/.* ---$/){error_source=t;sub(/^--- /,"",error_source);sub(/ ---$/,"",error_source);add(t,4);next}
+        if(t ~ /^--- /)error_source=""
+        if(error_source!="" && failure_group(t)!="" && t !~ /^\//){t="LOG " error_source " " t}
+      }
+      # A giant server_name line can contain dozens of aliases; make the
+      # primary vhost explicit without absorbing the whole quota.
       if(t ~ /^[^ ]+:[0-9]+ server_name /){
         split(t,a,/[[:space:]]+/); name=a[3];sub(/;$/,"",name)
-        if(name ~ /^[[:alnum:]][[:alnum:].-]*\.[[:alnum:].-]+$/ && name !~ /^[0-9.]+$/)
-          t="VHOST " name
+        if(name ~ /^[[:alnum:]][[:alnum:].-]*\.[[:alnum:].-]+$/ && name !~ /^[0-9.]+$/){add("VHOST " name,8);next}
       }
-      i=++n[section]
-      line[section,i]=t
-      rank[section,i]=priority(t)
-      if(i<=3 && rank[section,i]<3)rank[section,i]=3
+      add(t,0)
     }
     END {
+      finish_section()
       intro="[COMPACT TERMBIN REPORT] Original displayed report: " size " bytes. Selected evidence from every section; omissions are marked. Full report is in the terminal."
       header_bytes=length(intro)+1
       total_weight=0
       for(s=0;s<=section;s++){
         weight[s]=section_weight(title[s]);total_weight+=weight[s]
-        header_bytes+=length(title[s])+2+100
+        header_bytes+=length(title[s])+2+120
       }
       available=cap-header_bytes
       if(available<0)exit 2
-      print intro
+      total_used=0
       for(s=0;s<=section;s++){
-        print ""; print title[s]
         quota=int(available*weight[s]/total_weight)
         used=0; selected=0
-        # First represent distinct severe failure classes (latest evidence
-        # where possible), then reserve space for site/status context.
+        # Prefer compact structured evidence before noisy excerpts. A
+        # service state, HTTP result, traffic summary and OOM count keep
+        # their attribution even if full logs exceed the cap.
+        for(p=10;p>=8;p--){
+          for(i=1;i<=n[s];i++){
+            if(rank[s,i]!=p)continue
+            bytes=length(line[s,i])+1
+            if(used+bytes<=quota){keep[s,i]=1;used+=bytes;selected++}
+          }
+        }
+        # Include one recent specimen from distinct severe failure classes.
         for(p=7;p>=5;p--){
           for(i=n[s];i>=1;i--){
             group=failure_group(line[s,i])
-            if(rank[s,i]!=p || group=="" || seen[s,group])continue
+            if(rank[s,i]!=p || keep[s,i] || group=="" || seen[s,group])continue
             bytes=length(line[s,i])+1
-            if(used+bytes<=int(quota*0.55)){
-              keep[s,i]=1;used+=bytes;selected++;seen[s,group]=1
-            }
+            if(used+bytes<=quota){keep[s,i]=1;used+=bytes;selected++;seen[s,group]=1}
           }
         }
         # Primary vhost names and the inventory summary are more useful
@@ -1728,8 +1874,30 @@ paste_prepare() {
             if(used+bytes<=quota){keep[s,i]=1;used+=bytes;selected++}
           }
         }
+        selected_count[s]=selected
+        total_used+=used
+      }
+      # Quotas for small/empty sections may be unused. Reallocate exactly
+      # that space to high-priority records which did not fit elsewhere.
+      leftover=available-total_used
+      for(p=10;p>=8;p--){
+        for(s=0;s<=section;s++){
+          for(i=1;i<=n[s];i++){
+            if(rank[s,i]!=p || keep[s,i])continue
+            bytes=length(line[s,i])+1
+            if(bytes<=leftover){
+              keep[s,i]=1;leftover-=bytes;selected_count[s]++
+            }
+          }
+        }
+      }
+      print intro
+      for(s=0;s<=section;s++){
+        print ""; print title[s]
         for(i=1;i<=n[s];i++)if(keep[s,i])print line[s,i]
-        if(selected<n[s])printf "[COMPACT] %d detail lines omitted from this section.\n",n[s]-selected
+        essential_omitted=0
+        for(i=1;i<=n[s];i++)if(rank[s,i]>=8 && !keep[s,i])essential_omitted++
+        if(selected_count[s]<n[s])printf "[COMPACT] %d evidence/detail records omitted (%d high-priority); full report in terminal.\n",n[s]-selected_count[s],essential_omitted
       }
     }' "$file" > "$AUDIT_TMP/paste-compact" || return 1
   size=$(wc -c < "$AUDIT_TMP/paste-compact")
@@ -1776,6 +1944,9 @@ if [ "${SKIP_NET:-0}" != 1 ]; then
         if [[ ! "$paste_cap" =~ ^[0-9]{4,7}$ ]] || ((10#$paste_cap<4096 || 10#$paste_cap>1048576)); then paste_cap=30000; fi
         paste_cap=$((10#$paste_cap))
         head -n "$AUDIT_REPORT_LINES" "$FINAL" > "$PASTE_PAYLOAD"
+        if [ "${RAW_LINES:-0}" -gt "$AUDIT_REPORT_LINES" ]; then
+          printf '[!] REPORT TRUNCATED: %s source lines, %s displayed.\n' "$RAW_LINES" "$AUDIT_REPORT_LINES" >> "$PASTE_PAYLOAD"
+        fi
         paste_original_bytes=$(wc -c < "$PASTE_PAYLOAD")
         compact=1
         [ "${PASTE_MODE:-compact}" = full ] && compact=0
