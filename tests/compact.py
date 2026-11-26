@@ -38,6 +38,9 @@ sections=[
     "## INCIDENT — WEB STACK / VHOST ROUTING / UPSTREAM HEALTH\n"
     "/etc/nginx/site.conf:1 server_name main.test city.main.test;\n"
     "SITE main.test\nSITE other.test\nSITE other.test => NOT CHECKED (site probe cap 1)\n"
+    "APP_HTACCESS main.test state=empty bytes=0 mode=666\n"
+    "APP_ROUTE main.test FRONT https /wp-json/ via=127.0.0.1:443 HTTP 404 type=text/html [NOT FOUND]\n"
+    "APP_FINDING main.test FRONT WordPress REST pretty path=404 but query route=200 JSON\n"
     "SITE SUMMARY: discovered=2 selected=1 skipped=1\n"
     "FRONT http://main.test/ via 127.0.0.1:80 => HTTP 301 total=0.012s\n"
     "FRONT https://main.test/ via 127.0.0.1:443 => HTTP 502 total=0.030s [SERVER ERROR]\n"
@@ -45,6 +48,8 @@ sections=[
     "PUBLIC https://main.test/ => curl: (28) timeout HTTP 000 total=5.0s [TIMEOUT]\n"+filler,
     "## INCIDENT — WEB / PHP / DB ERROR LOGS\n"
     "--- /var/log/mariadb/error.log ---\n"
+    "APP_LOG /var/log/main.test.error.log captcha_signals=2 plugins=ithemes-security-pro (sampled; authentication failure cause unknown)\n"
+    "APP_COMPONENT_ERROR source=/var/log/main.test.error.log domain=main.test component=wordpress-plugins/broken-plugin severity=fatal category=dependency_or_compatibility count=1 (log path association; not proven root cause)\n"
     "2026-11-26 9:11:59 [ERROR] Table wp_options is marked as crashed\n"
     "--- /var/log/nginx/error.log ---\n"
     "2026/11/26 09:38:20 [error] upstream timed out, server: main.test\n"
@@ -94,6 +99,11 @@ with tempfile.TemporaryDirectory() as tmp:
     assert re.search(r"^SERVICE php-fpm\.service .*active=inactive.*is-enabled=disabled",output,re.M)
     assert "HTTP_SITE main.test " in output and "FRONT_https=502" in output
     assert "BACKEND_https:8290=NO_LISTENER" in output and "PUBLIC_https=000/TIMEOUT" in output
+    assert "APP_HTACCESS main.test state=empty" in output
+    assert "APP_ROUTE main.test FRONT https /wp-json/" in output
+    assert "APP_FINDING main.test FRONT WordPress REST pretty path=404 but query route=200 JSON" in output
+    assert "captcha_signals=2 plugins=ithemes-security-pro" in output
+    assert "component=wordpress-plugins/broken-plugin severity=fatal category=dependency_or_compatibility count=1" in output
     assert "SITE SUMMARY: discovered=2 selected=1 skipped=1" in output
     assert "SITE other.test => NOT CHECKED" in output
     assert "systemctl disable httpd --now" in output

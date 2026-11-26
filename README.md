@@ -1,4 +1,4 @@
-# server-audit v3.3.0
+# server-audit v3.4.0
 
 Универсальная диагностика Linux-сервера для технической поддержки. Один
 Bash-скрипт без установки обязательных зависимостей: определяет доступный стек, собирает
@@ -137,7 +137,11 @@ curl -fsSL https://raw.githubusercontent.com/lyfreedomitsme/server-audit/main/se
   HTTP(S)-бэкендам с корректным Host/SNI. Без перехода по редиректам и
   без сохранения тела. Для проверки локальной маршрутизации TLS отключена
   проверка сертификата; если фронт слушает конкретный локальный адрес, используется
-  доступный адрес listener. Внешний HTTPS-тест указанного домена проверяет
+  адрес из однозначно связанного с доменом vhost, если он подтверждён
+  локальными интерфейсами/слушателями. Если адрес неизвестен и есть
+  несколько отдельных listener, скрипт не подставляет случайный IP.
+  Общий/wildcard listener — только кандидат на локальный маршрут.
+  Внешний HTTPS-тест указанного домена проверяет
   сертификат штатно; AUDIT_PUBLIC_HTTP=1 добавляет внешние HTTPS-пробы
   для всех выбранных имён (если разрешён SKIP_NET=0). GET может попасть в access-log или запустить
   прикладную логику: `SKIP_HTTP=1` отключает эти пробы.
@@ -148,8 +152,72 @@ curl -fsSL https://raw.githubusercontent.com/lyfreedomitsme/server-audit/main/se
   памяти, лог ошибок и startup warnings. Поддерживаются типичные layout
   Debian/Ubuntu, RHEL, aaPanel, Remi, Plesk, cPanel.
 - Настройки MPM Apache и лимиты памяти/соединений MySQL/MariaDB.
-- DNS A-записей (ограниченное число имён), сравнение с внешним IP:
-  CDN/Cloudflare и прокси могут объяснять несовпадение.
+- Все найденные DNS A-записи сравниваются со всеми IPv4 интерфейсов
+  сервера и обнаруженным исходящим IP (а не только одним IP). Частичное
+  совпадение, отсутствие A и несовпадение отмечаются отдельно.
+  CDN/Cloudflare, NAT и прокси могут объяснять несовпадение.
+
+### Внутренние страницы / 404 / авторизация (v3.4.0)
+
+- Для выбранных имён определяется DocumentRoot из vhost Apache/Nginx,
+  если его можно однозначно сопоставить. Для нестандартных конфигураций
+  проверяются типичные layout ISPmanager/FastPanel/Hestia/Vesta/
+  DirectAdmin/Plesk/aaPanel/CloudPanel/CyberPanel и обычного хостинга.
+  Layout-кандидат не выдаётся за активный DocumentRoot; при неоднозначности
+  проверка не угадывает каталог. CMS распознаются по файловым маркерам
+  (WordPress, Laravel, Joomla, Drupal; файловые маркеры Node.js/Python);
+  PHP и wp-config.php не запускаются
+  и не читаются для этой проверки.
+- Статус .htaccess: отсутствует, пуст, symlink, нечитаем, есть RewriteRule
+  или правило не видно в первых 64 КиБ. Размер/права, в том числе
+  world-writable, отсутствие index.php/index.html. Содержимое .htaccess
+  не публикуется. Для Apache показываются выбранные routing modules и
+  относящиеся к корню кандидаты AllowOverride/AllowOverrideList/Options:
+  merge, include и фактическая загруженная конфигурация требуют отдельной
+  проверки. Пустой .htaccess без Apache vhost — не самостоятельный диагноз.
+- WordPress: сравнение GET /wp-json/ и /index.php?rest_route=/ с HTTP
+  статусом и типом ответа. 404 против 200 JSON указывает на вероятную
+  проблему ЧПУ/маршрутизации либо намеренное ограничение REST API.
+  Автоматически до AUDIT_APP_SITES WordPress-имён (по умолчанию 5),
+  отдельный AUDIT_DOMAIN приоритетен; при наличии связанного локального
+  backend и указанного домена дополнительно сравнивается backend.
+  При SKIP_HTTP=1 остаются только файловые проверки.
+- AUDIT_PATH позволяет проверить конкретный внутренний URL любой CMS
+  (/catalog/, /hide/, /api/ и т.п.) вместе с AUDIT_DOMAIN.
+  Только безопасный путь без query/fragment и без перехода по редиректам;
+  не передаются логины, пароли, CAPTCHA-токены, POST или cookies.
+- Инвентарь WordPress-плагинов, mu-plugins и тем: до 30 имён каждой
+  группы на сайт, для AUDIT_DOMAIN — версии по статическим заголовкам.
+  Это список установленных файлов, не список активных плагинов.
+  Никакой PHP/WP-CLI не запускается, содержимое конфигов/ключи не читаются.
+- APP_ERROR / APP_COMPONENT_ERROR: в последних 300 строках каждого
+  выбранного журнала группируются ошибки по категории и важности:
+  fatal/exception, синтаксис, TypeError, отсутствующие классы/методы/
+  функции/зависимости, PHP warning/deprecated, память/диск, БД
+  (таблицы, соединения, авторизация, повреждение), маршрутизация,
+  доступ/отсутствие файла, TLS/сеть/timeout, CAPTCHA/Turnstile.
+  Когда путь присутствует в сообщении, указывается компонент:
+  WordPress plugin/mu-plugin/theme, Composer package, Drupal module,
+  Joomla component, Node.js/Python package или generic plugin path. Упоминание в stack trace
+  не считается доказательством виновности компонента.
+- Кроме панельных Apache/Nginx/PHP логов, из обнаруженного DocumentRoot
+  берутся ограниченные хвосты WordPress debug.log, PHP error_log,
+  Laravel (включая два последних dated-файла), Symfony prod.log, Joomla
+  и generic error.log. Для этих файлов выводятся только категории,
+  счётчики и имена компонентов, без сырых сообщений/секретов.
+  Не каждый сбой (например, JavaScript в браузере, логин/CAPTCHA
+  или конфликт нескольких плагинов) оставляет серверный лог.
+  Сигналы и имена компонентов — доказательства для дальнейшего анализа,
+  не автоматическое утверждение причины. Ничего не отключается.
+- В компактном отчёте приоритет у ошибок маршрутизации, .htaccess,
+  fatal/error компонентов и сигналов авторизации. Сбор ограничен лимитами файлов/сайтов и времени;
+  нестандартные или контейнерные конфиги могут требовать отдельного анализа.
+
+Пример проверки внутренней страницы:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lyfreedomitsme/server-audit/main/server_audit.sh | AUDIT_DOMAIN=example.com AUDIT_PATH=/catalog/ PASTE=0 bash
+```
 
 ### Боты и нагрузка по access-логам
 
@@ -208,6 +276,8 @@ DDoS или взлом. Нестандартный формат логов мо�
 | Переменная | По умолчанию | Назначение |
 |---|---:|---|
 | AUDIT_DOMAIN | авто | Приоритетный hostname без схемы, пути или порта |
+| AUDIT_PATH | пусто | Внутренний URL-путь (требует AUDIT_DOMAIN; без query/fragment) |
+| AUDIT_APP_SITES | 5 | Лимит автоматических WordPress-имён для дополнительных GET, 1–30; явная цель сверх лимита |
 | AUDIT_PANEL_HOST | авто | Host/SNI панели для локальной проверки TLS и DNS; не адрес обычного сайта |
 | AUDIT_PANEL_PORT | авто | Дополнительный TCP-порт панели, 1–65535 |
 | AUDIT_HISTORY_DAYS | 7 | Интервал истории журналов, 1–90 дней |
@@ -322,6 +392,8 @@ AUDIT_DOMAIN=example.com AUDIT_HISTORY_DAYS=14 AUDIT_MAX_FILES=40 AUDIT_BOT_FILE
 bash -n server_audit.sh
 bash tests/incident.sh
 bash tests/sites.sh
+bash tests/app_routes.sh
+bash tests/control_plane.sh
 python3 tests/redaction.py
 python3 tests/hmac.py
 python3 tests/paste.py

@@ -378,6 +378,8 @@ if [ -n "$AUDIT_DOMAIN" ] && ! audit_domain_ok "$AUDIT_DOMAIN"; then
   exit 2
 fi
 AUDIT_DOMAIN=${AUDIT_DOMAIN,,}
+AUDIT_PATH="${AUDIT_PATH:-}"
+AUDIT_APP_SITES=$(audit_number "${AUDIT_APP_SITES:-5}" 5 30)
 
 audit_site_order() {
   # Read rows "primary name", "alias name", "target name". Deduplicate,
@@ -413,11 +415,12 @@ audit_nginx_site_records() {
 audit_apache_site_records() {
   awk '{
     for(i=1;i<NF;i++){
-      if($i=="namevhost"){print "primary",$(i+1);break}
-      if($i=="default" && $(i+1)=="server" && i+2<=NF){print "primary",$(i+2);break}
-      if($i=="alias"){print "alias",$(i+1);break}
-      if($i=="wild" && $(i+1)=="alias")break
+      if($i=="namevhost"){print "primary",$(i+1);next}
+      if($i=="default" && $(i+1)=="server" && i+2<=NF){print "primary",$(i+2);next}
+      if($i=="alias"){print "alias",$(i+1);next}
+      if($i=="wild" && $(i+1)=="alias")next
     }
+    if(NF>=3 && $NF ~ /^\(\/.*:[0-9]+\)$/)print "primary",$(NF-1)
   }'
 }
 audit_ols_site_records() {
@@ -661,17 +664,16 @@ audit_http() {
 }
 audit_front_address() {
   local port="$1" address
+  local -a concrete=()
+  mapfile -t concrete < <(printf '%s\n' "$TCP_LISTEN" | awk -v p="$port" '$4~(":"p"$"){a=$4;sub(":"p"$","",a);if(a!="*"&&a!="0.0.0.0"&&a!="[::]")print a}' | sort -u)
+  if ((${#concrete[@]}>1)); then return 1; fi
   if [[ "$(audit_local_port_status 127.0.0.1 "$port")" == LISTENER* ]]; then
     echo 127.0.0.1; return 0
   fi
-  # Some panels bind public/local interface addresses instead of loopback.
-  # Only choose an address reported as a local listener, never DNS resolution.
-  address=$(printf '%s\n' "$TCP_LISTEN" | awk -v p="$port" '$4~(":"p"$"){a=$4;sub(":"p"$","",a);if(a!="*"&&a!="0.0.0.0"&&a!="[::]"){print a;exit}}')
+  address=${concrete[0]:-}
   if [[ "$address" =~ ^[0-9]+(\.[0-9]+){3}$ || "$address" =~ ^\[[0-9a-fA-F:]+\]$ ]]; then
     printf '%s\n' "$address"
-  else
-    return 1
-  fi
+  else return 1; fi
 }
 
 audit_config_lines() {
@@ -683,20 +685,333 @@ audit_config_lines() {
       sub(/[[:space:]]+#.*/,"",line)
       if(pending!=""){ pending=pending " " line; if(pending !~ /;/)next; line=pending; pending="" }
       else if(line ~ /^server_name[[:space:]]/ && line !~ /;/){pending=line;next}
-      if(line ~ /^(server_name|listen|proxy_pass|fastcgi_pass|uwsgi_pass|scgi_pass|grpc_pass|upstream|server|error_log|access_log|include|limit_req|limit_req_zone|limit_conn|limit_conn_zone)[[:space:]]/){
+      if(line ~ /^(server_name|listen|proxy_pass|fastcgi_pass|uwsgi_pass|scgi_pass|grpc_pass|upstream|server|error_log|access_log|include|limit_req|limit_req_zone|limit_conn|limit_conn_zone|root|try_files)[[:space:]]/ || line ~ /^set[[:space:]]+\$root_path[[:space:]]/){
         # Strip URL userinfo/query strings; never expose request headers.
         sub(/[[:space:]]+#.*/,"",line); gsub(/\?[^;[:space:]]+/,"?[REDACTED]",line)
         print (src?src:"config") ":" NR " " line
       }
     }'
 }
+# Only static metadata: never source configs, execute PHP, or read wp-config.php.
+# A per-file nginx association is used only when every server_name in that file
+# includes the hostname (shared/multi-site files are deliberately ambiguous).
+audit_nginx_domain_directives() {
+  local domain="$1"
+  awk -v d="$domain" '
+    {src=$1; sub(/:[0-9]+$/,"",src)}
+    $2=="server_name" {
+      matched=0
+      for(i=3;i<=NF;i++){v=tolower($i);end=(v~/;/);sub(/;.*/,"",v);gsub(/"/,"",v);sub(/\.$/,"",v);if(v==d)matched=1;if(end)break}
+      if(matched)good[src]=1;else bad[src]=1
+    }
+    $2 ~ /^(listen|root|set|proxy_pass|try_files)$/ {s[++n]=src;line[n]=$0}
+    END{for(i=1;i<=n;i++)if(good[s[i]]&&!bad[s[i]])print line[i]}'
+}
+audit_apache_domain_locations() {
+  # apachectl -S supplies file:line and aliases; handle single as well as
+  # multiple name-based vhosts. Do not guess a root from the default vhost.
+  local domain="$1"
+  awk -v d="$domain" '
+    function emit(loc){if(loc ~ /^\(\/.*:[0-9]+\)$/){sub(/^\(/,"",loc);sub(/\)$/,"",loc);print loc}}
+    {
+      if($1=="alias"){if(tolower($2)==d)emit(last);next}
+      if($1=="wild")next
+      if($NF ~ /^\(\/.*:[0-9]+\)$/){
+        last=$NF
+        if(tolower($(NF-1))==d)emit(last)
+      }
+    }' | sort -u
+}
+audit_apache_domain_bindings() {
+  # apachectl -S reports address:port headers followed by namevhosts.
+  # Use only static IP/wildcard addresses when Apache is the frontend.
+  local domain="$1"
+  awk -v d="$domain" '
+    function output(a){if(a~/^(\*|[0-9.]+|\[[0-9a-fA-F:]+\]):[0-9]+$/)print "apache-vhost:0 listen " a}
+    {
+      if($1=="alias"){if(tolower($2)==d)output(last);next}
+      if($1=="wild")next
+      if($1~/^(\*|[0-9.]+|\[[0-9a-fA-F:]+\]):[0-9]+$/){addr=$1}
+      if(NF>=3 && $NF~/^\(\/.*:[0-9]+\)$/){
+        last=addr
+        if(tolower($(NF-1))==d)output(last)
+      }
+    }' | sort -u
+}
+audit_apache_docroot() {
+  local loc="$1" file="${1%:*}" line="${1##*:}"
+  [[ "$file" = /* && "$line" =~ ^[0-9]{1,8}$ && -f "$file" && -r "$file" ]] || return 0
+  # Limit to the mapped VirtualHost block. Global root and includes may
+  # apply; unresolved/variable paths must be reported as unknown.
+  awk -v start="$line" 'NR<start{next} NR>start+500{exit}
+    {v=tolower($0);if(v ~ /^[[:space:]]*<virtualhost[[:space:]]/){if(inblock)exit;inblock=1}
+     if(inblock && v ~ /^[[:space:]]*documentroot[[:space:]]/){
+       r=$0;sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/,"",r);sub(/[[:space:]]+#.*/,"",r);sub(/[[:space:]]+$/,"",r);gsub(/^"|"$/,"",r);print r
+     }
+     if(inblock && v ~ /^[[:space:]]*<\/virtualhost>/)exit
+    }' "$file" 2>/dev/null
+}
+audit_site_root() {
+  local d="$1" directives="$2" apache_sites="$3" loc root
+  local -a roots=() candidates=()
+  while IFS= read -r loc; do
+    [ -n "$loc" ] || continue
+    while IFS= read -r root; do
+      [[ "$root" = /* && "$root" != *'$'* ]] && roots+=("$root")
+    done < <(audit_apache_docroot "$loc")
+  done < <(printf '%s\n' "$apache_sites" | audit_apache_domain_locations "$d")
+  while IFS= read -r root; do
+    [[ "$root" = /* && "$root" != *'$'* ]] && roots+=("$root")
+  done < <(printf '%s\n' "$directives" | awk '$2=="root"{v=$3;sub(/;$/,"",v);gsub(/^"|"$/,"",v);if(v~/^\//)print v} $2=="set"&&$3=="$root_path"{v=$4;sub(/;$/,"",v);gsub(/^"|"$/,"",v);print v}')
+  # Deduplicate (HTTP + HTTPS, nginx + Apache); multiple distinct configured
+  # roots are ambiguous, even if only one currently exists.
+  if ((${#roots[@]})); then
+    mapfile -t roots < <(printf '%s\n' "${roots[@]}" | sort -u)
+    if ((${#roots[@]}==1)); then printf 'configured\t%s\n' "${roots[0]}"; else printf 'ambiguous\t-\n'; fi
+    return
+  fi
+  # Fallback for panels whose vhost dump is unavailable or uses variables.
+  # A layout match is a candidate, not proof of the active document root.
+  for root in /var/www/*/data/www/"$d" /home/*/web/"$d"/public_html /home/*/domains/"$d"/public_html /var/www/vhosts/"$d"/httpdocs /www/wwwroot/"$d" /home/*/htdocs/"$d" /var/www/"$d"/public_html /var/www/"$d" /home/"$d"/public_html; do
+    [ -d "$root" ] && candidates+=("$root")
+  done
+  if ((${#candidates[@]}==1)); then printf 'layout-candidate\t%s\n' "${candidates[0]}"
+  elif ((${#candidates[@]}>1)); then printf 'ambiguous\t-\n'; else printf 'unknown\t-\n'; fi
+}
+audit_apache_override_candidates() {
+  local domain="$1" root="$2" apache_sites="$3" loc file
+  local -a files=()
+  while IFS= read -r loc; do [ -n "$loc" ] && files+=("${loc%:*}"); done < <(printf '%s\n' "$apache_sites" | audit_apache_domain_locations "$domain")
+  ((${#files[@]})) || return 0
+  files+=(/etc/apache2/apache2.conf /etc/httpd/conf/httpd.conf /www/server/apache/conf/httpd.conf /usr/local/apache/conf/httpd.conf /etc/apache2/conf/httpd.conf)
+  declare -A seen=()
+  for file in "${files[@]}"; do
+    [ -f "$file" ] && [ -r "$file" ] || continue
+    [ -z "${seen[$file]+x}" ] || continue; seen["$file"]=1
+    awk -v d="$domain" -v r="$root" '
+      {v=tolower($0);if(v~/^[[:space:]]*<directory[[:space:]]/){
+        scope=$0;sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/,"",scope);sub(/>[[:space:]]*$/,"",scope);gsub(/^"|"$/,"",scope);sub(/\/$/,"",scope);if(scope=="")scope="/"
+        applicable=(scope=="/"||r==scope||index(r,scope "/")==1)
+      }else if(v~/^[[:space:]]*<\/directory>/){applicable=0}
+      else if(applicable && v~/^[[:space:]]*(allowoverride(list)?|options)[[:space:]]/){
+        text=$0;sub(/^[[:space:]]*/,"",text);sub(/[[:space:]]+#.*/,"",text)
+        printf "APP_OVERRIDE %s %s:%d scope=%s %s (candidate; includes/merging not evaluated)\n",d,FILENAME,NR,scope,text
+      }}' "$file" | head -n 12
+  done
+  return 0
+}
+# Static inventory only; never run application PHP/CLI or read credentials.
+audit_wp_header_version() {
+  local kind="$1" file="$2"
+  [ -f "$file" ] && [ -r "$file" ] && [ ! -L "$file" ] || return 0
+  head -c 8192 -- "$file" | awk -v k="$kind" '
+    {l=$0;sub(/^[[:space:]\/\*#]+/,"",l);sub(/[[:space:]]*\*\/[[:space:]]*$/,"",l)
+     if(tolower(l)~("^" k " name[[:space:]]*:"))name=1
+     if(tolower(l)~/^version[[:space:]]*:/){sub(/^[^:]+:[[:space:]]*/,"",l);sub(/[[:space:]]+$/,"",l);if(l~/^[a-zA-Z0-9._+-]+$/&&length(l)<=40)version=l}}
+    END{if(name)print (version?version:"unknown")}'
+}
+audit_wp_inventory() {
+  local d="$1" root="$2" kind dir item slug version f count total
+  local -a names=()
+  for kind in plugins mu-plugins themes; do
+    dir="$root/wp-content/$kind"
+    [ -d "$dir" ] || continue
+    names=(); total=0
+    for item in "$dir"/*; do
+      [ -e "$item" ] || continue
+      slug=${item##*/}
+      [[ "$slug" =~ ^[a-zA-Z0-9._-]{1,80}$ ]] || continue
+      [ -d "$item" ] || { [ -f "$item" ] && [[ "$slug" = *.php ]] && [ "$slug" != index.php ]; } || continue
+      ((total+=1)); (("${#names[@]}"<30)) || continue
+      names+=("$slug")
+      # Detailed installed version only for explicit target, bounded by 30
+      # entries and 8 candidate header files per component.
+      if [ "$d" = "$AUDIT_DOMAIN" ] && [ ! -L "$item" ]; then
+        version=unknown; count=0
+        if [ "$kind" = themes ] && [ -d "$item" ]; then
+          version=$(audit_wp_header_version theme "$item/style.css"); version=${version:-unknown}
+        elif [ -f "$item" ]; then
+          version=$(audit_wp_header_version plugin "$item"); version=${version:-unknown}
+        elif [ -d "$item" ]; then
+          for f in "$item/$slug.php" "$item"/*.php; do
+            [ -f "$f" ] || continue
+            ((count+=1)); ((count<=8)) || break
+            version=$(audit_wp_header_version plugin "$f")
+            [ -z "$version" ] || break
+          done
+          version=${version:-unknown}
+        fi
+        printf 'APP_COMPONENT %s kind=%s slug=%s installed_version=%s active=unknown (static header)\n' "$d" "$kind" "$slug" "$version"
+      fi
+    done
+    printf 'APP_COMPONENTS %s kind=%s installed_entries=%s listed=%s active=unknown (filesystem inventory)\n' "$d" "$kind" "$total" "$(IFS=,; echo "${names[*]}")"
+  done
+  return 0
+}
+audit_register_app_logs() {
+  local d="$1" root="$2" f dir i
+  local -a dated=() extra=()
+  for dir in "$root/storage/logs" "$root/../storage/logs"; do
+    dated=("$dir"/laravel-*.log)
+    for ((i=${#dated[@]}-1;i>=0 && i>=${#dated[@]}-2;i--)); do extra+=("${dated[i]}"); done
+  done
+  # Application-specific debug logs can contain credentials/request bodies.
+  # Only category/attribution summaries are emitted; symlinks are skipped.
+  for f in "$root/wp-content/debug.log" "$root/error_log" "$root/php_error.log" "$root/storage/logs/laravel.log" "$root/../storage/logs/laravel.log" "$root/administrator/logs/error.php" "$root/var/log/prod.log" "$root/../var/log/prod.log" "$root/logs/error.log" "$root/stderr.log" "$root/logs/stderr.log" "${extra[@]}"; do
+    [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || continue
+    [ -z "${AUDIT_APP_LOG_DOMAIN[$f]+x}" ] || continue
+    if (("${#AUDIT_APP_LOG_PATHS[@]}">=AUDIT_MAX_FILES)); then
+      echo "APP_NOTE $d application-log file cap reached ($AUDIT_MAX_FILES)"
+      break
+    fi
+    AUDIT_APP_LOG_PATHS+=("$f")
+    AUDIT_APP_LOG_DOMAIN["$f"]="$d"
+  done
+  return 0
+}
+audit_site_files() {
+  local d="$1" root="$2" source="$3" apache_bound="${4:-0}" wp=0 file="$2/.htaccess" mode size state
+  printf 'APP_ROOT %s source=%s path=%s\n' "$d" "$source" "$root"
+  [ "$root" != - ] || return 0
+  if [ ! -d "$root" ]; then
+    printf 'APP_FINDING %s document root missing or inaccessible (source=%s)\n' "$d" "$source"; return 0
+  fi
+  if [ -f "$root/wp-includes/version.php" ] && [ -f "$root/wp-load.php" ]; then
+    wp=1; printf 'APP_CMS %s WordPress (file markers; no PHP executed)\n' "$d"
+  elif [ -f "$root/artisan" ] || [ -f "$root/../artisan" ]; then
+    printf 'APP_CMS %s Laravel-like layout (file markers)\n' "$d"
+  elif [ -f "$root/configuration.php" ] && [ -d "$root/administrator" ]; then
+    printf 'APP_CMS %s Joomla-like layout (file markers)\n' "$d"
+  elif [ -f "$root/core/lib/Drupal.php" ]; then
+    printf 'APP_CMS %s Drupal-like layout (file markers)\n' "$d"
+  fi
+  [ ! -f "$root/package.json" ] || printf 'APP_RUNTIME %s Node.js-like layout (package.json exists; runtime not verified)\n' "$d"
+  if [ -f "$root/manage.py" ] || [ -f "$root/pyproject.toml" ] || [ -f "$root/requirements.txt" ]; then
+    printf 'APP_RUNTIME %s Python-like layout (file markers; runtime not verified)\n' "$d"
+  fi
+  if [ -L "$file" ]; then
+    state=symlink
+  elif [ ! -e "$file" ]; then
+    state=missing
+  elif [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    state=unreadable
+  else
+    size=$(stat -c %s -- "$file" 2>/dev/null || echo unknown)
+    mode=$(stat -c %a -- "$file" 2>/dev/null || echo unknown)
+    if [ "$size" = 0 ]; then state=empty
+    elif head -c 65536 -- "$file" | grep -iE '^[[:space:]]*RewriteRule[[:space:]]' >/dev/null; then state=rewrite-present
+    else state=no-rewrite-seen; fi
+    printf 'APP_HTACCESS %s state=%s bytes=%s mode=%s (first 64KiB; no content printed)\n' "$d" "$state" "$size" "$mode"
+    if [[ "$mode" =~ ^[0-7]{3,4}$ ]] && (( 8#$mode & 2 )); then
+      printf 'APP_FINDING %s .htaccess is world-writable\n' "$d"
+    fi
+  fi
+  case "$state" in missing|symlink|unreadable) printf 'APP_HTACCESS %s state=%s\n' "$d" "$state";; esac
+  if [ "$wp" = 1 ] && [[ "$state" = empty || "$state" = missing || "$state" = no-rewrite-seen ]]; then
+    if [ "$apache_bound" = 1 ]; then
+      printf 'APP_FINDING %s WordPress .htaccess %s with Apache vhost; pretty URLs may fail if routing is not configured elsewhere\n' "$d" "$state"
+    else
+      printf 'APP_NOTE %s WordPress .htaccess %s; not an error by itself (nginx-only or external rewrite configuration possible)\n' "$d" "$state"
+    fi
+  fi
+  [ -f "$root/index.php" ] || [ -f "$root/index.html" ] || printf 'APP_FINDING %s index.php/index.html absent (may be intentional)\n' "$d"
+}
+audit_local_address() {
+  local host="$1" bare="$1"
+  [[ "$host" = 127.* || "$host" = '[::1]' ]] && return 0
+  bare=${bare#\[}; bare=${bare%\]}
+  grep -Fxq -- "$bare" <<< "${AUDIT_LOCAL_IPS:-}" && return 0
+  # Exact bound listener is also evidence; a wildcard listener alone is not.
+  printf '%s\n' "$TCP_LISTEN" | awk -v h="$host" '{a=$4;sub(/:[0-9]+$/,"",a);if(a==h)found=1} END{exit !found}'
+}
+audit_domain_front() {
+  local port="$1" directives="$2" entry host specific=0
+  local -a addresses=() wild=()
+  # Explicit per-domain binding takes precedence over a global wildcard.
+  while IFS= read -r entry; do
+    entry=${entry%;}
+    if [[ "$entry" = "$port" || "$entry" = "*:$port" || "$entry" = "0.0.0.0:$port" ]]; then
+      [[ "$(audit_local_port_status 127.0.0.1 "$port")" == LISTENER* ]] && wild+=(127.0.0.1)
+    elif [ "$entry" = "[::]:$port" ]; then
+      [[ "$(audit_local_port_status '[::1]' "$port")" == LISTENER* ]] && wild+=('[::1]')
+    elif [[ "$entry" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|\[[0-9a-fA-F:]+\]):$port$ ]]; then
+      host=${BASH_REMATCH[1]}; specific=1
+      if audit_local_address "$host" && [[ "$(audit_local_port_status "$host" "$port")" == LISTENER* ]]; then addresses+=("$host"); fi
+    fi
+  done < <(printf '%s\n' "$directives" | awk '$2=="listen"{print $3}')
+  if ((specific)); then
+    if ((${#addresses[@]})); then
+      mapfile -t addresses < <(printf '%s\n' "${addresses[@]}" | sort -u)
+      printf '%s\n' "${addresses[0]}"; return 0
+    fi
+    return 1 # configured address is not locally confirmed; never dial a remote IP
+  fi
+  if ((${#wild[@]})); then printf '%s\n' "${wild[0]}"; return 0; fi
+  audit_front_address "$port"
+}
+audit_path_ok() {
+  # Explicit, simple paths only: no userinfo, query strings, fragments,
+  # control chars, percent-encoding, traversal, or credentials.
+  [[ "$1" =~ ^/[A-Za-z0-9._~/-]*$ && "$1" != //* && "$1" != *..* && ${#1} -le 200 ]]
+}
+audit_route_http() {
+  local label="$1" scheme="$2" d="$3" ip="$4" port="$5" path="$6" original=80 result rc code type
+  local args=(curl -q --noproxy '*' -sS --connect-timeout 2 --max-time 5)
+  [ "$scheme" = https ] && original=443
+  if [ "$label" != PUBLIC ]; then
+    args+=(-k --connect-to "$d:$original:$ip:$port")
+    [ "$label" = BACKEND ] && args+=(-H 'X-Forwarded-Proto: https')
+  fi
+  result=$(audit_cmd "${args[@]}" -o /dev/null -w '%{http_code} %{content_type}' "$scheme://$d$path" 2>/dev/null); rc=$?
+  code=${result%% *}; type=${result#* }
+  [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
+  # Emit only a media type, never arbitrary header values or response bodies.
+  type=${type%%;*}; [[ "$type" =~ ^[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+$ ]] || type=unknown
+  printf 'APP_ROUTE %s %s %s %s via=%s:%s HTTP %s type=%s [%s]\n' "$d" "$label" "$scheme" "$path" "${ip:-DNS}" "$port" "$code" "$type" "$(audit_http_classify "$code" "$rc")"
+}
+audit_route_pair() {
+  local label="$1" scheme="$2" d="$3" ip="$4" port="$5" wp="$6" start="$7" p out pretty="" query=""
+  local -a paths=()
+  [ "$wp" = 1 ] && paths+=(/wp-json/ '/index.php?rest_route=/')
+  [ "$d" = "$AUDIT_DOMAIN" ] && [ -n "$AUDIT_PATH" ] && paths+=("$AUDIT_PATH")
+  for p in "${paths[@]}"; do
+    if ((SECONDS-start>=AUDIT_HTTP_BUDGET)); then printf 'APP_ROUTE %s %s %s => NOT CHECKED (HTTP time budget)\n' "$d" "$label" "$p"; break; fi
+    out=$(audit_route_http "$label" "$scheme" "$d" "$ip" "$port" "$p")
+    printf '%s\n' "$out"
+    [ "$p" = /wp-json/ ] && pretty="$out"
+    [ "$p" = '/index.php?rest_route=/' ] && query="$out"
+  done
+  if [[ "$pretty" == *' HTTP 404 '* && "$query" == *' HTTP 200 type=application/json '* ]]; then
+    printf 'APP_FINDING %s %s WordPress REST pretty path=404 but query route=200 JSON; likely rewrite/routing or intentional REST restriction; compare .htaccess and vhost rules\n' "$d" "$label"
+  fi
+  return 0
+}
+audit_dns_status() {
+  local records="$1" local_ips="$2" resolved matches=0 total=0
+  while IFS= read -r resolved; do
+    [[ "$resolved" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+    ((total+=1))
+    grep -Fxq -- "$resolved" <<< "$local_ips" && ((matches+=1))
+  done <<< "$records"
+  if ((total==0)); then echo 'A-запись не получена (проверьте DNS/timeout/NXDOMAIN)'
+  elif ((matches==total)); then echo 'OK -> все A-записи совпадают с IP сервера'
+  elif ((matches>0)); then echo 'Часть A-записей совпадает с IP сервера; проверьте балансировку'
+  elif [ -z "$local_ips" ]; then echo 'Неизвестно: IP сервера не определены'
+  else echo 'A-записи не совпадают с известными IP сервера (CDN/прокси возможен)'; fi
+}
+if [ -n "$AUDIT_PATH" ] && { [ -z "$AUDIT_DOMAIN" ] || ! audit_path_ok "$AUDIT_PATH"; }; then
+  echo "[!] AUDIT_PATH requires AUDIT_DOMAIN and a simple absolute URL path (no query, fragment, or credentials)." >&2
+  exit 2
+fi
 audit_web() {
   sep "INCIDENT — WEB STACK / VHOST ROUTING / UPSTREAM HEALTH"
   TCP_LISTEN=$(audit_cmd ss -H -lntp 2>&1); TCP_OK=$?
   [ "$TCP_OK" = 0 ] && { TCP_OK=1; printf '%s\n' "$TCP_LISTEN" | head -n 70; } || { TCP_OK=0; printf '%s\n' "$TCP_LISTEN" | head -n 3; }
   UNIX_LISTEN=$(audit_cmd ss -H -lxnp 2>&1); UNIX_OK=$?
   [ "$UNIX_OK" = 0 ] && { UNIX_OK=1; printf '%s\n' "$UNIX_LISTEN" | grep -Ei 'php|nginx|apache|httpd|lsws|mysql|redis' | head -n 50; } || { UNIX_OK=0; echo "Unix listeners unavailable"; }
-  local ng="" routes="" apache_sites="" records="" f d target s p
+  AUDIT_LOCAL_IPS=""
+  if has ip; then AUDIT_LOCAL_IPS=$(audit_cmd ip -o addr show 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="inet"||$i=="inet6"){split($(i+1),a,"/");print a[1]}}' | sort -u); fi
+  local ng="" routes="" apache_sites="" records="" f d target s p directives root_info root_source root app_wp app_probe app_count=0 app_skipped=0 app_front="" app_scheme=""
   local targets=()
   if [ -n "$NGINX_BIN" ]; then
     audit_exec "$NGINX_BIN" -v
@@ -707,7 +1022,7 @@ audit_web() {
     routes=$(printf '%s\n' "$ng" | audit_config_lines)
     if [ -z "$routes" ] || [ "$rc" -ne 0 ]; then
       routes+=$'\n'
-      for f in /www/server/panel/vhost/nginx/*.conf /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+      for f in /www/server/panel/vhost/nginx/*.conf /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf /etc/nginx/vhosts/*/*.conf /home/*/conf/web/*/nginx.conf /usr/local/directadmin/data/users/*/nginx.conf; do
         [ -f "$f" ] || continue
         routes+=$( { printf '# configuration file %s:\n' "$f"; cat "$f"; } | audit_config_lines)
         routes+=$'\n'
@@ -735,13 +1050,15 @@ audit_web() {
     echo "--- Apache ($APACHE_BIN) ---"
     audit_exec "$APACHE_BIN" -v
     audit_exec "$APACHE_BIN" -t
+    echo "--- Apache routing modules (current on-disk config) ---"
+    audit_cmd "$APACHE_BIN" -M 2>/dev/null | grep -E 'rewrite_module|proxy_module|proxy_fcgi_module|fcgid_module|dir_module' | head -n 10 || true
     apache_sites=$(audit_cmd "$APACHE_BIN" -S 2>&1); local apache_rc=$?
     printf '%s\n' "$apache_sites" | head -n 100 | cut -c1-1000
     records+=$(printf '%s\n' "$apache_sites" | audit_apache_site_records)
     records+=$'\n'
     if [ "$apache_rc" -ne 0 ]; then
       echo "[!] Apache -S incomplete; reading known vhost paths (on-disk candidates)."
-      records+=$(for f in /www/server/panel/vhost/apache/*.conf /etc/apache2/sites-enabled/* /etc/httpd/conf.d/*.conf /var/www/vhosts/system/*/conf/httpd.conf /etc/apache2/conf/httpd.conf /usr/local/apache/conf/httpd.conf; do
+      records+=$(for f in /www/server/panel/vhost/apache/*.conf /etc/apache2/sites-enabled/* /etc/apache2/vhosts/*/*.conf /etc/httpd/conf.d/*.conf /home/*/conf/web/*/apache2.conf /usr/local/directadmin/data/users/*/httpd.conf /var/www/vhosts/system/*/conf/httpd.conf /etc/apache2/conf/httpd.conf /usr/local/apache/conf/httpd.conf; do
         [ -f "$f" ] || continue
         awk 'tolower($1)=="servername"{print "primary",$2} tolower($1)=="serveralias"{for(i=2;i<=NF;i++)print "alias",$i}' "$f"
       done)
@@ -775,7 +1092,38 @@ audit_web() {
   printf 'Discovered %s unique hostnames (including explicit target, if set).\n' "${#AUDIT_DISCOVERED_DOMAINS[@]}"
   for d in "${AUDIT_DISCOVERED_DOMAINS[@]}"; do printf 'SITE %s\n' "$d"; done
   echo "--- HTTP GET results (local origin; no redirects; local TLS verification disabled) ---"
-  local count=0 skipped=0 start_seconds=$SECONDS front_ip backend_status
+  local count=0 skipped=0 start_seconds front_ip backend_status
+  echo "--- Application metadata (read-only; no config secrets, no PHP execution) ---"
+  local meta_count=0
+  declare -A app_wordpress=()
+  declare -ga AUDIT_APP_LOG_PATHS=()
+  declare -gA AUDIT_APP_LOG_DOMAIN=()
+  for d in "${AUDIT_DISCOVERED_DOMAINS[@]}"; do
+    ((meta_count+=1))
+    ((meta_count<=AUDIT_MAX_SITES)) || break
+    directives=$(printf '%s\n' "$routes" | audit_nginx_domain_directives "$d")
+    if [ -z "$NGINX_BIN" ] && [ -n "$APACHE_BIN" ]; then
+      directives+=$'\n'$(printf '%s\n' "$apache_sites" | audit_apache_domain_bindings "$d")
+    fi
+    root_info=$(audit_site_root "$d" "$directives" "$apache_sites")
+    IFS=$'\t' read -r root_source root <<< "$root_info"
+    local apache_bound=0 apache_locations
+    apache_locations=$(printf '%s\n' "$apache_sites" | audit_apache_domain_locations "$d")
+    [ -z "$apache_locations" ] || apache_bound=1
+    audit_site_files "$d" "$root" "$root_source" "$apache_bound"
+    printf '%s\n' "$directives" | awk -v d="$d" '$2=="listen"{print "APP_BINDING " d " " $1 " " $3 " (on-disk candidate)"} $2=="try_files"{printf "APP_ROUTE_CONFIG %s %s",d,$1;for(i=2;i<=NF;i++)printf " %s",$i;print " (on-disk candidate)"}' | sort -u | head -n 12
+    if [ "$root" != - ]; then audit_apache_override_candidates "$d" "$root" "$apache_sites"; fi
+    if [ "$root" != - ] && [ -d "$root" ]; then
+      audit_register_app_logs "$d" "$root"
+      if [ -f "$root/wp-includes/version.php" ] && [ -f "$root/wp-load.php" ]; then
+        app_wordpress["$d"]=1
+        audit_wp_inventory "$d" "$root"
+      fi
+    fi
+  done
+  echo "APP_METADATA checked=$((meta_count>AUDIT_MAX_SITES?AUDIT_MAX_SITES:meta_count)) discovered=${#AUDIT_DISCOVERED_DOMAINS[@]} (layout candidates are not active vhost proof)"
+  echo "--- HTTP and optional application route probes ---"
+  start_seconds=$SECONDS
   for d in "${AUDIT_DISCOVERED_DOMAINS[@]}"; do
     if [ "${SKIP_HTTP:-0}" = 1 ] || ! has curl; then
       echo "SITE $d => NOT CHECKED (SKIP_HTTP=1 or missing curl)"
@@ -787,37 +1135,158 @@ audit_web() {
       echo "SITE $d => NOT CHECKED (HTTP time budget ${AUDIT_HTTP_BUDGET}s)"
     else
       ((count+=1))
+      directives=$(printf '%s\n' "$routes" | audit_nginx_domain_directives "$d")
+      if [ -z "$NGINX_BIN" ] && [ -n "$APACHE_BIN" ]; then
+        directives+=$'\n'$(printf '%s\n' "$apache_sites" | audit_apache_domain_bindings "$d")
+      fi
+      app_wp=${app_wordpress[$d]:-0}; app_probe=0; app_front=""; app_scheme=""
+      if [ "$d" = "$AUDIT_DOMAIN" ] && { [ "$app_wp" = 1 ] || [ -n "$AUDIT_PATH" ]; }; then
+        app_probe=1
+      elif [ "$app_wp" = 1 ] && ((app_count<AUDIT_APP_SITES)); then
+        app_probe=1; ((app_count+=1))
+      elif [ "$app_wp" = 1 ]; then ((app_skipped+=1)); fi
       if [ "$TCP_OK" != 1 ]; then
         echo "SITE $d => LOCAL CHECK UNAVAILABLE (ss unavailable)"
       else
         for s in http https; do
           p=80; [ "$s" = https ] && p=443
-          if front_ip=$(audit_front_address "$p"); then
+          if front_ip=$(audit_domain_front "$p" "$directives"); then
+            if ! printf '%s\n' "$directives" | awk -v p="$p" '$2=="listen"{v=$3;sub(/;$/,"",v);if(v==p||v~(":"p"$"))found=1}END{exit !found}'; then
+              echo "APP_NOTE $d $s frontend IP $front_ip is a listener fallback; exact vhost binding not resolved"
+            fi
             audit_http FRONT "$s" "$d" "$front_ip" "$p"
+            app_front="$front_ip"; app_scheme="$s"
           else
-            echo "FRONT $s://$d/ => NO LOCAL LISTENER on port $p"
+            if printf '%s\n' "$TCP_LISTEN" | awk -v p="$p" '$4~(":"p"$"){found=1}END{exit !found}'; then
+              echo "FRONT $s://$d/ => ORIGIN BINDING UNKNOWN OR UNAVAILABLE on port $p (not guessed)"
+            else echo "FRONT $s://$d/ => NO LOCAL LISTENER on port $p"; fi
           fi
         done
         while IFS= read -r target; do
           if [[ "$target" =~ ^(https?)://(127\.0\.0\.1|localhost):([0-9]{1,5})(/)?\;?$ ]]; then
             s="${BASH_REMATCH[1]}"; p="${BASH_REMATCH[3]}"
             backend_status=$(audit_local_port_status 127.0.0.1 "$p")
-            if [[ "$backend_status" == LISTENER* ]]; then audit_http BACKEND "$s" "$d" 127.0.0.1 "$p"
+            if [[ "$backend_status" == LISTENER* ]]; then
+              audit_http BACKEND "$s" "$d" 127.0.0.1 "$p"
+              [ "$app_probe" = 1 ] && [ "$d" = "$AUDIT_DOMAIN" ] && audit_route_pair BACKEND "$s" "$d" 127.0.0.1 "$p" "$app_wp" "$start_seconds"
             else echo "BACKEND $s://$d/ via 127.0.0.1:$p => $backend_status"; fi
           fi
-        done < <(printf '%s\n' "$routes" | awk -v d="$d" '$2=="server_name" {for(i=3;i<=NF;i++){name=tolower($i);ending=(name~/;/);sub(/;.*/,"",name);gsub(/"/,"",name);sub(/\.$/,"",name);if(name==d){src=$1;sub(/:[0-9]+$/,"",src);files[src]=1}if(ending)break}} $2=="proxy_pass" {src=$1;sub(/:[0-9]+$/,"",src);rows[++n]=src;dest[n]=$3} END{for(i=1;i<=n;i++)if(files[rows[i]])print dest[i]}' | sort -u | head -n 4)
+        done < <(printf '%s\n' "$directives" | awk '$2=="proxy_pass"{print $3}' | sort -u | head -n 4)
+        if [ "$app_probe" = 1 ] && [ -n "$app_front" ]; then
+          p=80; [ "$app_scheme" = https ] && p=443
+          audit_route_pair FRONT "$app_scheme" "$d" "$app_front" "$p" "$app_wp" "$start_seconds"
+        fi
       fi
       if [ "${SKIP_NET:-0}" != 1 ] && { [ "$d" = "$AUDIT_DOMAIN" ] || [ "${AUDIT_PUBLIC_HTTP:-0}" = 1 ]; }; then
         audit_http PUBLIC https "$d" "" 443
+        if [ "$app_probe" = 1 ] && [ "$d" = "$AUDIT_DOMAIN" ]; then
+          audit_route_pair PUBLIC https "$d" "" 443 "$app_wp" "$start_seconds"
+        fi
       fi
       continue
     fi
     ((skipped+=1))
   done
+  echo "APP_SUMMARY automatic WordPress route probes=$app_count skipped by app-site cap=$app_skipped; explicit target prioritized; no login POSTs"
   echo "SITE SUMMARY: discovered=${#AUDIT_DISCOVERED_DOMAINS[@]} selected=$count skipped=$skipped (HTTP results are point-in-time, not full application health)."
   ((skipped==0)) || echo "[!] Raise AUDIT_MAX_SITES/AUDIT_HTTP_BUDGET or set AUDIT_DOMAIN to prioritize specific names."
   echo "403/redirect/HTTP 200 alone is not proof of backend health; compare routing, logs and application response."
 
+}
+audit_app_log_signals() {
+  local file="$1" domain="${2:-unknown}"
+  awk -v f="$file" -v domain="$domain" '
+    function category(x) {
+      if(x~/allowed memory size.*exhausted|out of memory|memory exhausted/)return "memory_exhausted"
+      if(x~/no space left on device|disk quota exceeded|database or disk is full/)return "storage_full"
+      if(x~/table.*(doesn.t exist|not exist|unknown table)|no such table/)return "database_missing_table"
+      if(x~/table.*(crash|corrupt)|database.*corrupt/)return "database_corruption"
+      if(x~/error establishing a database connection|sqlstate\[hy000\].*connection|mysql.*(connection refused|server has gone away)|database.*(connection refused|unable to connect)|too many connections/)return "database_connection"
+      if(x~/access denied for user|sqlstate\[28000\]|authentication failed.*database/)return "database_auth"
+      if(x~/wordpress database error|sqlstate\[|database query error/)return "database_query"
+      if(x~/call to undefined (function|method)|class .* not found|interface .* not found|trait .* not found|cannot redeclare|failed opening required|require.*failed to open stream|cannot load.*extension|unable to load dynamic library|cannot find module|module_not_found|modulenotfounderror|no module named|importerror/)return "dependency_or_compatibility"
+      if(x~/php parse error|syntax error|syntaxerror|unexpected token/)return "syntax_error"
+      if(x~/typeerror|argumentcounter|argument.*must be of type|unsupported operand types/)return "type_error"
+      if(x~/captcha|recaptcha|turnstile/)return "captcha"
+      if(x~/rewrite.*(error|denied|loop|limit)|redirect.*(loop|limit)|htaccess.*(invalid|denied|not allowed)/)return "routing"
+      if(x~/primary script unknown|no input file specified|script not found|unable to open primary script|no such file or directory|file not found/)return "missing_file"
+      if(x~/permission denied|client denied by server configuration|operation not permitted/)return "permission"
+      if(x~/maximum execution time.*exceeded|connection timed out|upstream timed out|read data timeout|curl error 28|gateway timeout/)return "timeout"
+      if(x~/ssl certificate problem|certificate verify failed|ssl handshake|tls handshake/)return "tls"
+      if(x~/connection refused|could not resolve host|network is unreachable|curl error [67]:/)return "network"
+      if(x~/php fatal error|uncaught (error|exception)|fatal error|critical error|segmentation fault|referenceerror|attributeerror|keyerror|runtimeerror|traceback \(most recent call last\)/)return "fatal_or_exception"
+      if(x~/php deprecated|deprecation warning|deprecated:/)return "deprecated"
+      if(x~/php warning|warning:|undefined array key|undefined property/)return "runtime_warning"
+      if(x~/php notice|notice: undefined/)return "runtime_notice"
+      if(x~/\.(error|critical|alert|emergency):|exception:|exception occurred|application error/)return "application_exception"
+      return ""
+    }
+    function severity(x,c) {
+      if(x~/fatal error|uncaught|parse error|critical|emergency/||c=="memory_exhausted"||c=="syntax_error"||c=="storage_full")return "fatal"
+      if(c~/^(database_|dependency_|type_error|permission|missing_file|routing|timeout|tls|network|fatal_or_exception|application_exception)/)return "error"
+      if(c=="runtime_notice"||c=="deprecated")return "notice"
+      return "warning"
+    }
+    function component(x, m,a) {
+      if(match(x,/wp-content\/(plugins|mu-plugins|themes)\/[a-z0-9_.-]+/)){
+        m=substr(x,RSTART,RLENGTH);split(m,a,"/");return "wordpress-" a[2] "/" a[3]}
+      if(match(x,/vendor\/[a-z0-9_.-]+\/[a-z0-9_.-]+/))return "composer-" substr(x,RSTART,RLENGTH)
+      if(match(x,/node_modules\/(@[a-z0-9_.-]+\/)?[a-z0-9_.-]+/))return "node-" substr(x,RSTART,RLENGTH)
+      if(match(x,/site-packages\/[a-z0-9_.-]+/))return "python-" substr(x,RSTART,RLENGTH)
+      if(match(x,/modules\/(contrib|custom)\/[a-z0-9_.-]+/))return "drupal-" substr(x,RSTART,RLENGTH)
+      if(match(x,/components\/com_[a-z0-9_.-]+/))return "joomla-" substr(x,RSTART,RLENGTH)
+      if(match(x,/plugins\/[a-z0-9_.-]+\/[a-z0-9_.-]+/))return "plugin-path/" substr(x,RSTART,RLENGTH)
+      return ""
+    }
+    function sev_rank(s){return s=="fatal"?4:s=="error"?3:s=="warning"?2:1}
+    {x=tolower($0);c=category(x);comp=component(x)
+      if(x~/captcha|recaptcha|turnstile/){
+        captcha++
+        if(match(x,/wp-content\/plugins\/[a-z0-9_-]+/)){p=substr(x,RSTART,RLENGTH);sub(/^.*\//,"",p);plugins[p]=1}
+      }
+      if(c=="routing")routing++
+      if(c=="database_missing_table")db++
+      if(c=="missing_file")script++
+      if(c=="permission")permission++
+      if(c!=""){
+        sev=severity(x,c);key=sev SUBSEP c;categories[key]++
+        if(comp!=""){
+          key=comp SUBSEP sev SUBSEP c;hits[key]++
+        }
+      }else if(comp!="" && x~/^[[:space:]]*#[0-9]+[[:space:]]/){stack[comp]++}
+    }
+    END{
+      if(captcha){p="";for(k in plugins)p=p (p?",":"") k;printf "APP_LOG %s captcha_signals=%d plugins=%s (sampled; authentication failure cause unknown)\n",f,captcha,(p?p:"unknown")}
+      if(routing||db||script||permission)printf "APP_LOG %s routing_signals=%d missing_table_signals=%d missing_script_signals=%d permission_signals=%d (sampled; may be intentional requests)\n",f,routing,db,script,permission
+      # Rank fatal/error categories ahead of noisy notices. Fixed output cap;
+      # report counts only, never bodies, query values, credentials or traces.
+      for(i=1;i<=8;i++){
+        best="";score=-1
+        for(k in categories){split(k,a,SUBSEP);rank=sev_rank(a[1])*100000+categories[k];if(rank>score||(rank==score&&k<best)){score=rank;best=k}}
+        if(best=="")break
+        split(best,a,SUBSEP)
+        printf "APP_ERROR source=%s domain=%s severity=%s category=%s count=%d (sampled)\n",f,domain,a[1],a[2],categories[best]
+        delete categories[best]
+      }
+      for(i=1;i<=10;i++){
+        best="";score=-1
+        for(k in hits){split(k,a,SUBSEP);rank=sev_rank(a[2])*100000+hits[k];if(rank>score||(rank==score&&k<best)){score=rank;best=k}}
+        if(best=="")break
+        split(best,a,SUBSEP)
+        printf "APP_COMPONENT_ERROR source=%s domain=%s component=%s severity=%s category=%s count=%d (log path association; not proven root cause)\n",f,domain,a[1],a[2],a[3],hits[best]
+        delete hits[best]
+      }
+      for(k in stack){if(++seen_stack>3)break;printf "APP_STACK_MENTION source=%s domain=%s component=%s count=%d (stack frame only; not culprit proof)\n",f,domain,k,stack[k]}
+    }'
+}
+audit_log_domain() {
+  local file="$1" d base="${1##*/}"
+  for d in "${AUDIT_DISCOVERED_DOMAINS[@]}"; do
+    if [[ "$base" = "$d.error.log" || "$base" = "$d-error_log" || "$base" = "$d.error_log" || "$file" = *"/$d/"* ]]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  echo unknown
 }
 audit_logs() {
   sep "INCIDENT — WEB / PHP / DB ERROR LOGS"
@@ -838,7 +1307,7 @@ audit_logs() {
     echo "--- $f ($(stat -c 'mtime=%y bytes=%s' "$f" 2>/dev/null)) ---"
     # Bounded tail, then filter; timestamps remain intact. Avoid printing
     # query strings (often moderation tokens), long request bodies or raw configs.
-    audit_cmd tail -n 300 "$f" | grep -iE 'error|warn|crit|alert|emerg|fatal|failed|refused|timeout|timed out|denied|oom|killed|max_children|server reached|segfault|shutdown|ready for connections|starting' | tail -n "$AUDIT_LOG_LINES" | cut -c1-1200
+    audit_cmd tail -n 300 "$f" | grep -iE 'error|warn|crit|alert|emerg|fatal|failed|refused|timeout|timed out|denied|oom|killed|max_children|server reached|segfault|shutdown|ready for connections|starting|captcha|recaptcha|rewrite|permission denied|primary script unknown' | tail -n "$AUDIT_LOG_LINES" | cut -c1-1200
   done
   echo "--- recent rotated plain-text service logs (.1; if present) ---"
   for f in /www/wwwlogs/nginx_error.log.1 /var/log/nginx/error.log.1 /var/log/apache2/error.log.1 /var/log/httpd/error_log.1 /usr/local/lsws/logs/error.log.1 /var/log/mysql/error.log.1; do
@@ -853,6 +1322,18 @@ audit_logs() {
     ((count+=1)); [ "$count" -le 100 ] || { echo "[!] upstream scan limited to 100 logs"; break; }
     audit_cmd tail -n 300 "$f" | grep -iE 'connect\(\) failed|upstream timed out|no live upstreams|upstream prematurely closed|SSL_do_handshake|no such file or directory.*upstream' | tail -n 2 | sed "s|^|$f: |" | cut -c1-900
   done | head -n 60
+  echo "--- application/component errors (site and app logs, last 300 lines/file, cap 100; summary only) ---"
+  count=0; seen=()
+  local app_domain
+  for f in "${AUDIT_APP_LOG_PATHS[@]}" "${files[@]}" /var/www/httpd-logs/*.error.log /var/log/nginx/domains/*.error.log /var/www/vhosts/system/*/logs/{proxy_error_log,error_log}; do
+    [ -r "$f" ] && [ -f "$f" ] || continue
+    [ -z "${seen[$f]+x}" ] || continue; seen["$f"]=1
+    ((count+=1)); [ "$count" -le 100 ] || { echo "[!] application log scan limited to 100 logs"; break; }
+    app_domain=${AUDIT_APP_LOG_DOMAIN[$f]:-unknown}
+    if [ "$app_domain" = unknown ]; then app_domain=$(audit_log_domain "$f"); fi
+    audit_cmd tail -n 300 "$f" | audit_app_log_signals "$f" "$app_domain"
+  done
+  echo "APP_LOG_SUMMARY checked=$((count>100?100:count)) (log observations, not full incident history)"
 }
 audit_tuning() {
   sep "INCIDENT — PHP POOLS / DB MEMORY LIMITS / PANEL CONFIG METADATA"
@@ -1341,8 +1822,8 @@ audit_firewall_health() {
 
 main_audit() {
 audit_detect
-echo "SERVER AUDIT REPORT v3.3.0"
-echo "History: last $AUDIT_HISTORY_DAYS days, current and previous retained boot; target: ${AUDIT_DOMAIN:-auto}"
+echo "SERVER AUDIT REPORT v3.4.0"
+echo "History: last $AUDIT_HISTORY_DAYS days, current and previous retained boot; target: ${AUDIT_DOMAIN:-auto}; path: ${AUDIT_PATH:-auto}"
 echo "Host: $(hostname)   Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 echo "===================================================="
 
@@ -1737,6 +2218,8 @@ if [ "${SKIP_NET:-0}" != "1" ]; then
     SERVER_PUBLIC_IP=$(curl -q -s --max-time 5 https://api.ipify.org 2>/dev/null || true)
     [ -z "$SERVER_PUBLIC_IP" ] && SERVER_PUBLIC_IP=$(curl -q -s --max-time 5 https://ifconfig.me 2>/dev/null || true)
   fi
+  local_ips=$( { audit_cmd ip -o -4 addr show 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="inet"){split($(i+1),a,"/");print a[1]}}'; printf '%s\n' "$SERVER_PUBLIC_IP"; } | grep -E '^[0-9]+(\.[0-9]+){3}$' | sort -u)
+  echo "IPv4 адреса интерфейсов и внешний IP: $(printf '%s\n' "$local_ips" | paste -sd, -)"
   echo "Внешний IP сервера (определён автоматически): ${SERVER_PUBLIC_IP:-не удалось определить}"
   echo
   if ((${#AUDIT_DISCOVERED_DOMAINS[@]})); then
@@ -1750,20 +2233,14 @@ if [ "${SKIP_NET:-0}" != "1" ]; then
       audit_domain_ok "$d" || continue
       ((checked+=1)); [ "$checked" -le "$AUDIT_MAX_SITES" ] || break
       if has dig; then
-        resolved=$(audit_cmd dig +time=2 +tries=1 +short A "$d" 2>/dev/null | tail -n1)
+        resolved=$(audit_cmd dig +time=2 +tries=1 +short A "$d" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | sort -u)
       elif has getent; then
-        resolved=$(audit_cmd getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | tail -n1)
+        resolved=$(audit_cmd getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u)
       else
         resolved=""
       fi
-      if [ -z "$resolved" ]; then
-        status="A-запись не получена (проверьте DNS/timeout/NXDOMAIN)"
-      elif [ -n "$SERVER_PUBLIC_IP" ] && [ "$resolved" = "$SERVER_PUBLIC_IP" ]; then
-        status="OK -> указывает на этот сервер"
-      else
-        status="указывает на $resolved (не совпадает с этим сервером)"
-      fi
-      printf '%-35s %-18s %s\n' "$d" "${resolved:--}" "$status"
+      status=$(audit_dns_status "$resolved" "$local_ips")
+      printf '%-35s %-18s %s\n' "$d" "$(printf '%s\n' "${resolved:--}" | paste -sd, -)" "$status"
     done
   else
     echo "Домены в известных конфигах веб-сервера не найдены; нестандартные конфигурации могут требовать отдельной проверки."
@@ -2014,6 +2491,7 @@ paste_prepare() {
   LC_ALL=C awk -v cap="$cap" -v size="$size" -v target="${AUDIT_DOMAIN:-}" '
     function failure_group(x) {
       x=tolower(x)
+      if(x ~ /captcha|recaptcha|turnstile/)return "application authentication/CAPTCHA"
       if(x ~ /upstream timed out|connection timed out/)return "upstream timeout"
       if(x ~ /connection refused|no matching listener|no unix socket|no local listener/)return "missing upstream"
       if(x ~ /table.*crash|table.*corrupt|wp_options.*crash/)return "database corruption"
@@ -2030,6 +2508,10 @@ paste_prepare() {
     }
     function priority(t, x) {
       x=tolower(t)
+      if(x ~ /^app_components |^app_component |^app_runtime /)return 4
+      if(x ~ /^app_component_error .*severity=(fatal|error)|^app_error .*severity=(fatal|error)/)return 10
+      if(x ~ /^app_finding|^app_log .*captcha_signals|^app_route .*http (404|5[0-9][0-9])|^app_htaccess .*state=(missing|empty|unreadable)/)return 10
+      if(x ~ /^app_route|^app_root|^app_cms|^app_htaccess|^app_summary|^app_override|^app_log|^app_binding|^app_note|^app_metadata|^app_route_config|^app_component_error|^app_error|^app_components|^app_component |^app_stack_mention|^app_log_summary/)return 8
       if(x ~ /^firewall drift|^panel .*\[timeout\]|^panel .*\[tls failure\]|^package apt dependency check exit=[1-9]|^package dpkg audit \(exit=|^package installed (i[^i ]|[^i])|unmet dependencies|depends:.*but|number of update exceeded/)return 10
       if(x ~ /^panel detected |^panel listener |^panel .*http [0-9][0-9][0-9]|^package dpkg audit:|^package apt dependency check|^panel dns |^package candidate |^package installed |^firewall .*port=/)return 8
       if(target!="" && index(x,tolower(target)))return 7
@@ -2090,6 +2572,7 @@ paste_prepare() {
       code="UNKNOWN"
       if(match(t,/HTTP [0-9][0-9][0-9]/))code=substr(t,RSTART+5,3)
       if(t ~ /NO MATCHING LISTENER|NO LOCAL LISTENER/)code="NO_LISTENER"
+      else if(t ~ /ORIGIN BINDING UNKNOWN OR UNAVAILABLE/)code="ORIGIN_UNKNOWN"
       else if(t ~ /TIMEOUT|timed out|curl: \(28\)/)code=code "/TIMEOUT"
       else if(t ~ /CONNECT FAILURE|Connection refused|curl: \(7\)/)code=code "/CONNECT_FAILURE"
       else if(t ~ /TLS FAILURE/)code=code "/TLS_FAILURE"
@@ -2097,7 +2580,7 @@ paste_prepare() {
       if(match(t,/total=[0-9.]+s/))code=code "/" sprintf("%.3fs",substr(t,RSTART+6,RLENGTH-7)+0)
       part=key "=" code
       probes[d]=probes[d] (probes[d]!=""?",":"") part
-      if(code ~ /^(000|5[0-9][0-9]|NO_LISTENER)|FAILURE|TIMEOUT/)hostbad[d]=1
+      if(code ~ /^(000|5[0-9][0-9]|NO_LISTENER|ORIGIN_UNKNOWN)|FAILURE|TIMEOUT/)hostbad[d]=1
       return 1
     }
     function flush_http(  i,d) {
