@@ -960,7 +960,7 @@ audit_access_sample() {
 
 main_audit() {
 audit_detect
-echo "SERVER AUDIT REPORT v3.2.2"
+echo "SERVER AUDIT REPORT v3.2.3"
 echo "History: last $AUDIT_HISTORY_DAYS days, current and previous retained boot; target: ${AUDIT_DOMAIN:-auto}"
 echo "Host: $(hostname)   Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 echo "===================================================="
@@ -2012,28 +2012,48 @@ ip="$3"
 url="https://termbin.com/$slug"
 delete_url="https://termbin.com/delete?slug=$slug"
 http_request() {
+  local request_timeout="$1"; shift
   curl -q -4 --noproxy '*' --proto '=https' --resolve "termbin.com:443:$ip" \
-    -sS --connect-timeout 4 --max-time 8 "$@" 2>/dev/null
+    -sS --connect-timeout 10 --max-time "$request_timeout" "$@"
+}
+# Separate the HTTP status from the transport result. HTTP 000 alone does
+# not explain whether the server was slow, TLS failed, or TCP was unavailable.
+report_curl_error() {
+  local method="$1" rc="$2" output="$3" message
+  [ "$rc" -ne 0 ] || return 0
+  message=$(printf '%s\n' "$output" | grep -m1 '^curl: (' | tr -cd '[:print:]' | cut -c1-240)
+  printf '[!] %s curl exit=%s%s\n' "$method" "$rc" "${message:+: $message}"
 }
 printf '%s\n' DELETE_WORKER_READY
 sleep "$ttl"
 for attempt in 1 2 3; do
-  deleted=unknown
-  if response=$(http_request --max-filesize 4096 -w '\n%{http_code}' -X POST "$delete_url"); then
-    post=${response##*$'\n'}
-    if [[ "$response" =~ \"deleted\"[[:space:]]*:[[:space:]]*true ]]; then deleted=true
-    elif [[ "$response" =~ \"deleted\"[[:space:]]*:[[:space:]]*false ]]; then deleted=false; fi
-  else
-    post=000
+  # The service has a ten-minute self-delete window. Reserve a margin for
+  # the earlier upload and GET; do not start another POST after that window.
+  remaining=$((570 - SECONDS))
+  if [ "$remaining" -le 5 ]; then
+    echo '[!] Истекает окно самостоятельного удаления Termbin.'
+    break
   fi
+  post_timeout=60
+  [ "$remaining" -lt "$post_timeout" ] && post_timeout="$remaining"
+  deleted=unknown
+  response=$(http_request "$post_timeout" -w '\n%{http_code}' -X POST "$delete_url" 2>&1)
+  post_rc=$?
+  post=${response##*$'\n'}
   [[ "$post" =~ ^[0-9]{3}$ ]] || post=000
-  get=$(http_request -o /dev/null -w '%{http_code}' -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$url") || get=000
-  case "$get" in
-    404|410)
-      printf '[OK] Ссылка недоступна (HTTP %s; попытка %s/3, POST %s, deleted=%s).\n' "$get" "$attempt" "$post" "$deleted"
-      exit 0 ;;
-  esac
-  printf '[!] Попытка %s/3: POST %s, deleted=%s, GET %s.\n' "$attempt" "$post" "$deleted" "$get"
+  if [[ "$response" =~ \"deleted\"[[:space:]]*:[[:space:]]*true ]]; then deleted=true
+  elif [[ "$response" =~ \"deleted\"[[:space:]]*:[[:space:]]*false ]]; then deleted=false; fi
+  report_curl_error POST "$post_rc" "$response"
+  get_response=$(http_request 15 -o /dev/null -w '\n%{http_code}' -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$url" 2>&1)
+  get_rc=$?
+  get=${get_response##*$'\n'}
+  [[ "$get" =~ ^[0-9]{3}$ ]] || get=000
+  report_curl_error GET "$get_rc" "$get_response"
+  if [ "$get_rc" -eq 0 ] && [[ "$get" =~ ^(404|410)$ ]]; then
+    printf '[OK] Ссылка недоступна (HTTP %s; попытка %s/3, POST %s, deleted=%s).\n' "$get" "$attempt" "$post" "$deleted"
+    exit 0
+  fi
+  printf '[!] Попытка %s/3: POST %s, curl exit=%s, deleted=%s, GET %s, curl exit=%s.\n' "$attempt" "$post" "$post_rc" "$deleted" "$get" "$get_rc"
   if [ "$attempt" -lt 3 ]; then sleep "$((attempt * 2))"; fi
 done
 echo '[!] Удаление НЕ подтверждено. Ссылка может оставаться доступной. Используйте команду ручного удаления выше.'

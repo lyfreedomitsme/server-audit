@@ -48,6 +48,7 @@ assert '-4' in args and '--resolve' in args and 'termbin.com:443:192.0.2.123' in
 p=Path(os.environ['TEST_EVENTS'])
 prev=[json.loads(i) for i in p.read_text().splitlines()] if p.exists() else []
 method='POST' if '-X' in args and args[args.index('-X')+1]=='POST' else 'GET'
+assert int(args[args.index('--max-time')+1]) == (60 if method=='POST' else 15),args
 attempt=1+sum(i['method']==method for i in prev)
 scenario=os.environ.get('TEST_SCENARIO','success')
 if scenario=='retry':
@@ -61,6 +62,8 @@ else:
     code='204' if method=='POST' else ('410' if scenario=='gone' else '404')
 event={'time':time.monotonic(),'method':method,'attempt':attempt,'code':code,'args':args}
 with p.open('a') as f: f.write(json.dumps(event)+'\\n')
+if code=='000':
+    print('curl: (28) Operation timed out',file=sys.stderr)
 if method=='POST':
     # JSON false may be returned with HTTP 200: the GET must decide visibility.
     print(json.dumps({'deleted':code=='204'}))
@@ -166,6 +169,7 @@ sys.exit(28 if code=='000' else 0)
         assert expected in result,(scenario,result)
         if scenario in ("failure","timeout"): assert "[OK]" not in result,result
         if scenario=="failure": assert "deleted=false" in result,result
+        if scenario=="timeout": assert "curl exit=28" in result and "Operation timed out" in result,result
         print(f"PASS: {scenario} ({len(ev)} HTTP calls)",flush=True)
     reset()
     for extra in ({},{"PASTE":"0"},{"PASTE":"1","SKIP_NET":"1"}):
