@@ -39,6 +39,12 @@ printf '%s\\r\\n\\000' "${TEST_URL:-https://termbin.com/test123}"
 import json, os, sys, time
 from pathlib import Path
 args=sys.argv[1:]
+if '%{remote_ip}' in args:
+    if os.environ.get('TEST_PREFLIGHT_FAIL') == '1': sys.exit(28)
+    assert '-4' in args and '--noproxy' in args and args[-1]=='https://termbin.com/',args
+    print('192.0.2.123',end='')
+    sys.exit(0)
+assert '-4' in args and '--resolve' in args and 'termbin.com:443:192.0.2.123' in args,args
 p=Path(os.environ['TEST_EVENTS'])
 prev=[json.loads(i) for i in p.read_text().splitlines()] if p.exists() else []
 method='POST' if '-X' in args and args[args.index('-X')+1]=='POST' else 'GET'
@@ -47,13 +53,17 @@ scenario=os.environ.get('TEST_SCENARIO','success')
 if scenario=='retry':
     code=('503' if method=='POST' else '200') if attempt==1 else ('204' if method=='POST' else '404')
 elif scenario=='failure':
-    code='503' if method=='POST' else '403'
+    # Real Termbin can refuse deletion while returning a successful HTTP status.
+    code='200'
 elif scenario=='timeout':
     code='000'
 else:
     code='204' if method=='POST' else ('410' if scenario=='gone' else '404')
 event={'time':time.monotonic(),'method':method,'attempt':attempt,'code':code,'args':args}
 with p.open('a') as f: f.write(json.dumps(event)+'\\n')
+if method=='POST':
+    # JSON false may be returned with HTTP 200: the GET must decide visibility.
+    print(json.dumps({'deleted':code=='204'}))
 print(code,end='')
 sys.exit(28 if code=='000' else 0)
 """)
@@ -74,7 +84,7 @@ sys.exit(28 if code=='000' else 0)
     def event_list():
         return [json.loads(row) for row in events.read_text().splitlines()] if events.exists() else []
 
-    def interactive(answer, extra=None, limit=35):
+    def interactive(answer, extra=None, limit=35, interrupt_on_link=False):
         env=base | (extra or {})
         pid, fd = pty.fork()
         if pid == 0:
@@ -104,6 +114,9 @@ sys.exit(28 if code=='000' else 0)
                     sent += 1
                 if b"https://termbin.com/test123" in output and link_at is None:
                     link_at=time.monotonic()
+                    if interrupt_on_link:
+                        assert status.exists() and "DELETE_WORKER_READY" in status.read_text()
+                        os.write(fd,b"\x03")
             else:
                 os.kill(pid,9)
                 raise AssertionError("interactive test timed out")
@@ -137,13 +150,13 @@ sys.exit(28 if code=='000' else 0)
     ev=event_list()
     assert link is not None and link-start<3, "link not immediate"
     assert upload.read_text()=="redacted test report\n", "wrong payload"
-    assert "-N -w 15 termbin.com 9999" in nc_args.read_text()
+    assert "-N -w 15 192.0.2.123 9999" in nc_args.read_text()
     assert [e["method"] for e in ev]==["POST","GET"], ev
     assert ev[0]["time"]-link>=14.5, ev
     assert ev[0]["time"]-link<19, ev
     assert ev[0]["args"][-1]=="https://termbin.com/delete?slug=test123",ev
     assert ev[1]["args"][-1]=="https://termbin.com/test123",ev
-    assert "[OK]" in result and "HTTP 404" in result, result
+    assert "[OK]" in result and "HTTP 404" in result and "deleted=true" in result, result
     print(f"PASS: link after {link-start:.2f}s, delete after {ev[0]['time']-link:.2f}s, confirmed GET 404",flush=True)
     for scenario,expected,number in (("retry","[OK]",4),("failure","НЕ подтверждено",6),("timeout","НЕ подтверждено",6),("gone","HTTP 410",2)):
         reset()
@@ -152,6 +165,7 @@ sys.exit(28 if code=='000' else 0)
         assert len(ev)==number,(scenario,ev)
         assert expected in result,(scenario,result)
         if scenario in ("failure","timeout"): assert "[OK]" not in result,result
+        if scenario=="failure": assert "deleted=false" in result,result
         print(f"PASS: {scenario} ({len(ev)} HTTP calls)",flush=True)
     reset()
     for extra in ({},{"PASTE":"0"},{"PASTE":"1","SKIP_NET":"1"}):
@@ -203,3 +217,30 @@ sys.exit(28 if code=='000' else 0)
     while len(event_list())<2 and time.monotonic()<deadline: time.sleep(.05)
     assert len(event_list())==2,"worker died with parent"
     print("PASS: detached worker continues after parent termination",flush=True)
+    reset()
+    result,_,_=interactive("y",{"TEST_PREFLIGHT_FAIL":"1"})
+    assert not upload.exists() and not events.exists() and "IPv4 Termbin" in result
+    print("PASS: failed same-destination preflight refuses to upload",flush=True)
+    # The link must only become visible after the background worker is running.
+    # Test actual terminal Ctrl+C, and simulate a BusyBox-style setsid lacking --wait.
+    import shutil
+    real_setsid=shutil.which("setsid")
+    assert real_setsid
+    script.write_text(original_script.replace('AUDIT_TMP="$TEST_DIR"\n',
+        """AUDIT_TMP="$TEST_DIR"
+trap 'rm -f "$AUDIT_TMP/paste-delete-status"' EXIT
+trap 'exit 130' INT
+"""))
+    for busybox_style in (False,True):
+        reset()
+        if busybox_style:
+            wrapper=root/"setsid"
+            wrapper.write_text('#!/bin/bash\nif [ "$1" = "--help" ]; then echo "BusyBox setsid [-c] PROG ARGS"; exit 0; fi\nexec '+real_setsid+' "$@"\n')
+            wrapper.chmod(0o700)
+        result,_,link=interactive("y",{"PASTE_TTL":"2"},interrupt_on_link=True)
+        assert link is not None
+        deadline=time.monotonic()+5
+        while len(event_list())<2 and time.monotonic()<deadline: time.sleep(.05)
+        assert len(event_list())==2,(busybox_style,result,event_list())
+        print("PASS: immediate Ctrl+C after displayed URL; worker completed", "BusyBox-style" if busybox_style else "util-linux",flush=True)
+

@@ -960,7 +960,7 @@ audit_access_sample() {
 
 main_audit() {
 audit_detect
-echo "SERVER AUDIT REPORT v3.2.1"
+echo "SERVER AUDIT REPORT v3.2.2"
 echo "History: last $AUDIT_HISTORY_DAYS days, current and previous retained boot; target: ${AUDIT_DOMAIN:-auto}"
 echo "Host: $(hostname)   Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 echo "===================================================="
@@ -1914,7 +1914,7 @@ paste_upload() {
   help=$(timeout 2s nc -h 2>&1 || true)
   if grep -Eq '(^|[[:space:],])-N([[:space:],]|$)' <<< "$help"; then args+=(-N); fi
   if grep -Eq '(^|[[:space:],])-w([[:space:],]|$)' <<< "$help"; then args+=(-w 15); fi
-  timeout -k 2s 25s nc "${args[@]}" termbin.com 9999 < "$payload" 2>"$errors" | head -c 2048 > "$response"
+  timeout -k 2s 25s nc "${args[@]}" "${PASTE_IP:-termbin.com}" 9999 < "$payload" 2>"$errors" | head -c 2048 > "$response"
   rc=${PIPESTATUS[0]}
   PASTE_NC_RC="$rc"
   PASTE_RESPONSE_BYTES=$(wc -c < "$response")
@@ -1986,65 +1986,112 @@ if [ "$DO_PASTE" = 1 ]; then
   # Termbin allows self-service deletion for ten minutes. Leave time for retries.
   ttl=$(audit_number "${PASTE_TTL:-15}" 15 540)
   if [ "${PASTE_TTL:-15}" = 0 ]; then ttl=0; fi
+  PASTE_IP=""
   if ! has nc || ! has timeout; then
     echo "[!] nc/timeout unavailable; public upload skipped."
   elif [ "$ttl" != 0 ] && { ! has curl || { ! has setsid && ! has nohup; }; }; then
     echo "[!] Для проверяемого удаления нужны curl и setsid/nohup. Публикация отменена."
   else
-    # Only upload the size-checked and redacted payload once.
-    if paste_upload "$PASTE_PAYLOAD"; then
-      slug="${PASTE_URL##*/}"
-      echo "Ссылка: $PASTE_URL"
-      echo "[!] Ссылка публичная; данные уже переданы стороннему сервису."
-      echo "Ручное удаление (с того же IP):"
-      printf '  curl -q --noproxy "*" -fsS -X POST "https://termbin.com/delete?slug=%s"\n' "$slug"
-      if [ "$ttl" = 0 ]; then
-        echo "[!] Автоматическое удаление отключено (PASTE_TTL=0)."
-      else
-        echo "[*] Через $ttl сек. начнётся удаление. Откройте ссылку и скопируйте отчёт сейчас."
-        # Detached worker: it does not need the raw report, or an open SSH/TTY.
-        # Its output is captured privately and displayed by the waiting parent.
-        # A GET with 404/410 confirms only that the original URL is unavailable
-        # at the moment of the check, not that backups/copies were erased.
-        delete_code=$(cat <<'DELETE_WORKER'
+    can_upload=1
+    if [ "$ttl" != 0 ]; then
+      # Match the IPv4 destination for raw TCP upload and HTTPS deletion.
+      # This cannot guarantee the same external source IP behind NAT.
+      PASTE_IP=$(curl -q -4 --noproxy '*' --proto '=https' -sS --connect-timeout 4 --max-time 8 \
+        -o /dev/null -w '%{remote_ip}' https://termbin.com/) || PASTE_IP=""
+      if [[ ! "$PASTE_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        echo "[!] Не удалось определить IPv4 Termbin; публикация без проверяемого удаления отменена."
+        can_upload=0
+      fi
+      # Prepare the worker and select the launcher before uploading anything.
+      delete_code=$(cat <<'DELETE_WORKER'
 set -u
-sleep "$1"
+trap '' HUP INT QUIT
+ttl="$1"
 slug="$2"
+ip="$3"
 url="https://termbin.com/$slug"
 delete_url="https://termbin.com/delete?slug=$slug"
-http_code() {
-  curl -q --noproxy '*' --proto '=https' -sS --connect-timeout 4 --max-time 8 \
-    -o /dev/null -w '%{http_code}' "$@" 2>/dev/null
+http_request() {
+  curl -q -4 --noproxy '*' --proto '=https' --resolve "termbin.com:443:$ip" \
+    -sS --connect-timeout 4 --max-time 8 "$@" 2>/dev/null
 }
+printf '%s\n' DELETE_WORKER_READY
+sleep "$ttl"
 for attempt in 1 2 3; do
-  post=$(http_code -X POST "$delete_url") || post=000
-  get=$(http_code -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$url") || get=000
+  deleted=unknown
+  if response=$(http_request --max-filesize 4096 -w '\n%{http_code}' -X POST "$delete_url"); then
+    post=${response##*$'\n'}
+    if [[ "$response" =~ \"deleted\"[[:space:]]*:[[:space:]]*true ]]; then deleted=true
+    elif [[ "$response" =~ \"deleted\"[[:space:]]*:[[:space:]]*false ]]; then deleted=false; fi
+  else
+    post=000
+  fi
+  [[ "$post" =~ ^[0-9]{3}$ ]] || post=000
+  get=$(http_request -o /dev/null -w '%{http_code}' -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$url") || get=000
   case "$get" in
     404|410)
-      printf '[OK] Ссылка недоступна (HTTP %s; попытка %s/3, POST %s).\n' "$get" "$attempt" "$post"
+      printf '[OK] Ссылка недоступна (HTTP %s; попытка %s/3, POST %s, deleted=%s).\n' "$get" "$attempt" "$post" "$deleted"
       exit 0 ;;
   esac
-  printf '[!] Попытка %s/3: POST %s, GET %s.\n' "$attempt" "$post" "$get"
+  printf '[!] Попытка %s/3: POST %s, deleted=%s, GET %s.\n' "$attempt" "$post" "$deleted" "$get"
   if [ "$attempt" -lt 3 ]; then sleep "$((attempt * 2))"; fi
 done
 echo '[!] Удаление НЕ подтверждено. Ссылка может оставаться доступной. Используйте команду ручного удаления выше.'
 exit 1
 DELETE_WORKER
 )
-        status_file="$AUDIT_TMP/paste-delete-status"
-        if has setsid && setsid --help 2>&1 | grep -q -- '--wait'; then
-          setsid --wait bash -c "$delete_code" bash "$ttl" "$slug" </dev/null >"$status_file" 2>&1 &
-        elif has nohup; then
-          nohup bash -c "$delete_code" bash "$ttl" "$slug" </dev/null >"$status_file" 2>&1 &
+      if has setsid; then
+        if setsid --help 2>&1 | grep -q -- '--wait'; then
+          delete_launcher=(setsid --wait)
         else
-          # Some BusyBox versions have setsid but lack --wait. With job
-          # control disabled, this child is not a process group leader.
-          setsid bash -c "$delete_code" bash "$ttl" "$slug" </dev/null >"$status_file" 2>&1 &
+          # BusyBox setsid: prefer a new session even if --wait is missing.
+          delete_launcher=(setsid)
         fi
+      else
+        delete_launcher=(nohup)
+      fi
+    fi
+    if [ "$can_upload" = 0 ]; then
+      :
+    # Only upload the size-checked and redacted payload once.
+    elif paste_upload "$PASTE_PAYLOAD"; then
+      slug="${PASTE_URL##*/}"
+      worker_ready=0
+      if [ "$ttl" != 0 ]; then
+        status_file="$AUDIT_TMP/paste-delete-status"
+        "${delete_launcher[@]}" bash -c "$delete_code" bash "$ttl" "$slug" "$PASTE_IP" \
+          </dev/null >"$status_file" 2>&1 &
         delete_pid=$!
+        # Never display the URL before the worker confirms it was started.
+        # This closes the Ctrl+C race between showing the URL and launching cleanup.
+        for ((i=0;i<40;i++)); do
+          if grep -Fxq DELETE_WORKER_READY "$status_file" 2>/dev/null; then
+            worker_ready=1
+            break
+          fi
+          sleep 0.05
+        done
+      fi
+      echo "Ссылка: $PASTE_URL"
+      echo "[!] Ссылка публичная; данные уже переданы стороннему сервису."
+      echo "Ручное удаление (с того же IP):"
+      if [ -n "$PASTE_IP" ]; then
+        printf '  curl -q -4 --noproxy "*" --resolve "termbin.com:443:%s" -sS -X POST "https://termbin.com/delete?slug=%s"\n' "$PASTE_IP" "$slug"
+      else
+        printf '  curl -q --noproxy "*" -sS -X POST "https://termbin.com/delete?slug=%s"\n' "$slug"
+      fi
+      if [ "$ttl" = 0 ]; then
+        echo "[!] Автоматическое удаление отключено (PASTE_TTL=0)."
+      elif [ "$worker_ready" = 1 ]; then
+        echo "[*] Таймер удаления запущен ($ttl сек.). Откройте ссылку и скопируйте отчёт сейчас."
         wait "$delete_pid" || true
-        if [ -s "$status_file" ]; then cat "$status_file"
-        else echo "[!] Не удалось получить результат проверки. Удаление не подтверждено."; fi
+        if grep -Eq '^\[OK\]|НЕ подтверждено' "$status_file" 2>/dev/null; then
+          sed '/^DELETE_WORKER_READY$/d' "$status_file"
+        else
+          echo "[!] Не удалось получить результат проверки. Удаление не подтверждено."
+        fi
+      else
+        echo "[!] Не подтверждён запуск удаления. Используйте команду ручного удаления выше."
       fi
     else
       echo "[!] Нет корректной ссылки от Termbin (nc exit=$PASTE_NC_RC, отправляемый размер=$(wc -c < "$PASTE_PAYLOAD") байт, ответ=$PASTE_RESPONSE_BYTES байт)."
