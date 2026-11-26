@@ -80,6 +80,8 @@ sys.exit(28 if code=='000' else 0)
         if pid == 0:
             os.execvpe("bash", ["bash", "-c", 'cat "$1" | bash', "bash", str(script)], env)
         output=bytearray()
+        answers = [answer] if isinstance(answer, str) else answer
+        sent = 0
         sent_at=None
         link_at=None
         deadline=time.monotonic()+limit
@@ -93,9 +95,13 @@ sys.exit(28 if code=='000' else 0)
                     raise
                 if not part: break
                 output.extend(part)
-                if b"y/N:" in output and sent_at is None:
+                if output.count(b"y/N:") > sent:
+                    assert sent < len(answers), output
+                    assert not upload.exists(), "upload before valid confirmation"
                     sent_at=time.monotonic()
-                    os.write(fd,answer.encode()+b"\n")
+                    choice = answers[sent]
+                    os.write(fd, b"\x04" if choice is None else choice.encode()+b"\n")
+                    sent += 1
                 if b"https://termbin.com/test123" in output and link_at is None:
                     link_at=time.monotonic()
             else:
@@ -104,13 +110,24 @@ sys.exit(28 if code=='000' else 0)
         finally:
             os.close(fd)
             os.waitpid(pid,0)
-        assert sent_at is not None,output
+        assert sent_at is not None and sent == len(answers),output
         return output.decode(errors="replace"),sent_at,link_at
 
     reset()
     result,_,_=interactive("n")
     assert not upload.exists() and not events.exists()
     print("PASS: interactive n does not publish",flush=True)
+    for answers in (["N"], [""], [None], ["н", "abc", "yes", " ", " y", "n"], ["yY", "no", ""]):
+        reset()
+        result,_,_=interactive(answers)
+        assert not upload.exists() and not events.exists(), result
+        assert result.count("y/N:") == len(answers), result
+        assert result.count("Введите y или N") == len(answers)-1, result
+    print("PASS: malformed inputs re-prompt; n/N, empty Enter and EOF decline",flush=True)
+    reset()
+    result,_,_=interactive(["н", "wrong", "Y"],{"PASTE_TTL":"1"})
+    assert result.count("y/N:") == 3 and upload.exists() and len(event_list()) == 2
+    print("PASS: uppercase Y after multiple invalid answers publishes once",flush=True)
     reset()
     # Real 15-second wall-clock measurement, with mocked Termbin HTTP responses.
     real_ttl_env=base.copy()

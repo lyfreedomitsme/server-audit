@@ -960,7 +960,7 @@ audit_access_sample() {
 
 main_audit() {
 audit_detect
-echo "SERVER AUDIT REPORT v3.2"
+echo "SERVER AUDIT REPORT v3.2.1"
 echo "History: last $AUDIT_HISTORY_DAYS days, current and previous retained boot; target: ${AUDIT_DOMAIN:-auto}"
 echo "Host: $(hostname)   Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 echo "===================================================="
@@ -1964,10 +1964,19 @@ if [ "${SKIP_NET:-0}" != 1 ]; then
               echo "[!] Опубликовать отчёт на termbin.com? Ссылка публичная, без пароля."
               echo "Запланировано удаление и проверка доступности ссылки. Гарантии конфиденциальности нет."
               echo "Отчёт может содержать IP, домены, логи и нераспознанные секреты."
-              printf 'y/N: '
-              answer=""
-              read -r answer </dev/tty || true
-              case "$answer" in y|Y|yes|YES) DO_PASTE=1 ;; esac ;;
+              while true; do
+                printf 'y/N: '
+                # Read the exact answer from the TTY even when invoked via curl | bash.
+                # EOF/TTY loss must never authorize a public upload.
+                if ! IFS= read -r answer </dev/tty; then
+                  break
+                fi
+                case "$answer" in
+                  y|Y) DO_PASTE=1; break ;;
+                  ""|n|N) break ;;
+                  *) echo "[!] Введите y или N (Enter = N)." ;;
+                esac
+              done ;;
           esac
         fi
       fi ;;
