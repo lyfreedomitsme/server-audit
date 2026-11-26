@@ -1269,8 +1269,10 @@ if [ "${SKIP_NET:-0}" != 1 ]; then
     0|n|N|no|NO) ;;
     *)
       if [ -t 1 ] && ( : </dev/tty ) 2>/dev/null; then
-        echo "[!] termbin is PUBLIC. Report may contain IPs/domains/logs and residual secrets."
-        printf 'Опубликовать публично? (y/N): '
+        echo "[!] Опубликовать отчёт на termbin.com? Ссылка публичная, без пароля."
+        echo "Запланирована попытка удаления через ${PASTE_TTL:-15} сек. Удаление не гарантировано."
+        echo "Отчёт может содержать IP, домены, логи и нераспознанные секреты."
+        printf 'y/N: '
         answer=""
         read -r answer </dev/tty || true
         case "$answer" in y|Y|yes|YES) DO_PASTE=1 ;; esac
@@ -1283,13 +1285,22 @@ if [ "$DO_PASTE" = 1 ]; then
     PASTE_URL=$(head -n "$AUDIT_REPORT_LINES" "$FINAL" | timeout -k 2s 15s nc termbin.com 9999 2>/dev/null | tr -d '\000\r\n' | head -c 200)
     if [[ "$PASTE_URL" =~ ^https://termbin\.com/([A-Za-z0-9_-]{1,80})$ ]]; then
       slug="${BASH_REMATCH[1]}"
-      echo "Public URL: $PASTE_URL"
-      echo "[!] Link is public; deletion and expiration are NOT guaranteed."
+      echo "Ссылка: $PASTE_URL"
+      echo "[!] Ссылка публичная; гарантировать удаление и истечение срока мы не можем."
+      echo "Попытка ручного удаления (с того же IP):"
+      printf '  curl -X POST "https://termbin.com/delete?slug=%s"\n' "$slug"
       ttl=$(audit_number "${PASTE_TTL:-15}" 15 86400)
-      if has curl && has setsid; then
-        echo "Attempting deletion in $ttl seconds (best effort)."
-        setsid bash -c 'sleep "$1"; curl -q -fsS --max-time 10 -X POST "https://termbin.com/delete?slug=$2" >/dev/null 2>&1' bash "$ttl" "$slug" </dev/null >/dev/null 2>&1 &
+      if [ "${PASTE_TTL:-15}" = 0 ]; then ttl=0; fi
+      if [ "$ttl" = 0 ]; then
+        echo "[!] Автоматическое удаление отключено (PASTE_TTL=0)."
+      elif has curl && (has setsid || has nohup); then
+        echo "[*] Попытка автоматического удаления через $ttl сек. Успейте скопировать ссылку."
+        delete_runner=setsid
+        has setsid || delete_runner=nohup
+        "$delete_runner" bash -c 'sleep "$1"; curl -q -fsS --max-time 10 -X POST "https://termbin.com/delete?slug=$2" >/dev/null 2>&1' bash "$ttl" "$slug" </dev/null >/dev/null 2>&1 &
         disown 2>/dev/null || true
+      else
+        echo "[!] Не удалось запланировать автоудаление: отсутствуют curl/setsid/nohup. Используйте команду выше."
       fi
     else echo "[!] Upload response missing/unexpected; use the local report."; fi
   else echo "[!] nc/timeout unavailable; public upload skipped."; fi
