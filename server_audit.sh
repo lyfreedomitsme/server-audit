@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# server_audit.sh — универсальный сборщик диагностики сервера.
+# server_audit.sh — диагностика сервера, HMAC-метки секретов и проверяемая очистка Termbin.
 #
 # Определяет, что установлено на сервере (веб-сервер, БД, панель управления,
 # Docker, WireGuard и т.д.), проверяет ресурсы/логи/статус только для того,
@@ -76,26 +76,260 @@ run() { echo "--- \$ $* ---"; audit_cmd bash -c "$*" 2>&1; echo; }
 # докер-контейнеров.
 redact_file() {
   local src="$1" dst="$2"
-  sed -E \
-    -e '/\b(mysql|mysqldump|mariadb|mariadb-dump|psql|pg_dump|pg_restore|mongorestore|mongodump)\b/ s/(^|[[:space:]])-p([^[:space:]]{3,})/\1-p[REDACTED]/g' \
-    -e 's/((api[_-]?key|access[_-]?key|secret[_-]?key|[a-z0-9_]*_key|secret|token|passwd|password|pass|pwd)[[:space:]]*[:=][[:space:]]*)"[^"]*"/\1"[REDACTED]"/gI' \
-    -e "s/((api[_-]?key|access[_-]?key|secret[_-]?key|[a-z0-9_]*_key|secret|token|passwd|password|pass|pwd)[[:space:]]*[:=][[:space:]]*)'[^']*'/\1'[REDACTED]'/gI" \
-    -e 's/((api[_-]?key|access[_-]?key|secret[_-]?key|service[_-]?role[_-]?key|[a-z0-9_]*_key|private[_-]?key|secret|token|passwd|password|pass|pwd)[[:space:]]*[:=][[:space:]]*)[^[:space:]]+/\1[REDACTED]/gI' \
-    -e 's#([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@[:space:]]*):[^@/[:space:]]+@#\1:[REDACTED]@#g' \
-    -e 's#([?&])[a-zA-Z0-9_.%-]+=[^[:space:]&"<>]+#\1[REDACTED_QUERY]#g' \
-    -e 's/((Authorization|Cookie|Set-Cookie)[[:space:]]*:[[:space:]]*).*/\1[REDACTED]/gI' \
-    -e 's/gh[pousr]_[A-Za-z0-9_]{20,}/[REDACTED_GITHUB_TOKEN]/g' \
-    -e 's/AKIA[0-9A-Z]{16}/[REDACTED_AWS_KEY]/g' \
-    -e 's/(private key:[[:space:]]*)[^[:space:]].*/\1[REDACTED]/gI' \
-    -e 's/(preshared key:[[:space:]]*)[^[:space:]].*/\1[REDACTED]/gI' \
-    -e 's/(Bearer[[:space:]]+)[A-Za-z0-9_.=-]{10,}/\1[REDACTED]/gI' \
-    -e 's/eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}/[REDACTED_JWT]/g' \
-    "$src" 2>/dev/null | awk '
-      /-----BEGIN [A-Za-z0-9 ]*PRIVATE KEY-----/ { print "[REDACTED PRIVATE KEY BLOCK]"; skip=1; next }
-      /-----END [A-Za-z0-9 ]*PRIVATE KEY-----/   { skip=0; next }
-      skip { next }
-      { print }
-    ' > "$dst"
+  # Python is optional: the conservative previous filter is always available.
+  # Never show the raw report or leave a partially written output on failure.
+  if has python3 && redact_file_hmac "$src" "$dst" 2>/dev/null; then
+    return 0
+  fi
+  # Rewrite from the original, not partially processed output.
+  {
+    printf '%s\n' '[SECRET MODE] Masking only; comparison unavailable (Python 3 missing or failed).'
+    redact_file_mask_only "$src"
+  } > "$dst"
+}
+
+redact_file_hmac() (
+  ulimit -c 0 2>/dev/null || true
+  # The random key is generated inside Python and never travels via process
+  # arguments, environment, files, network, or report. One key per invocation.
+  python3 -I -S - "$1" "$2" <<'PYTHON_SECRET_FILTER'
+import hashlib
+import hmac
+import json
+import os
+import re
+import sys
+from urllib.parse import unquote, unquote_plus
+
+key = os.urandom(32)
+# 96 bits is ample for matching a bounded log report. Tags are intentionally
+# unlinkable between independent audits and are NOT password verifiers.
+existing_marker = re.compile(r"\[REDACTED(?:[ _][A-Z0-9_ ]+)?\]")
+existing_tag = re.compile(r"\[SECRET:[0-9a-fA-F]{24}\]")
+
+def emit_tag(value):
+    if not value:
+        return "[REDACTED_EMPTY]"
+    if existing_marker.fullmatch(value):
+        return value
+    if existing_tag.fullmatch(value):
+        return "[REDACTED_EXISTING_TAG]"
+    if value in ("(hidden)", "(none)"):
+        return "[REDACTED]"
+    result = "[SECRET:" + hmac.new(
+        key, value.encode("utf-8", "surrogateescape"), hashlib.sha256
+    ).hexdigest()[:24] + "]"
+    return result
+
+secret_name = (
+    r"(?:[a-z0-9_.-]*[_-])?"
+    r"(?:password|passwd|pwd|pass|passphrase|secret|token|api[_-]?key|"
+    r"access[_-]?key|private[_-]?key|client[_-]?secret|session[_-]?id|"
+    r"session[_-]?token|auth[_-]?token|access[_-]?token|refresh[_-]?token|"
+    r"authorization|credential(?:s)?|requirepass|key|dbpass|dbpassword|"
+    r"mysqlpwd|mysql_pwd|secretaccesskey|cookie|set-cookie|proxy-authorization)"
+)
+secret_field = re.compile(r"^(?:" + secret_name + r")$", re.I)
+double = r'"(?:\\.|[^"\\])*"'
+single = r"'(?:\\.|[^'\\])*'"
+# Malformed quoted values: redact to end of line rather than leaking a suffix.
+bare = r"[^\s,;}\"'<>]+"
+value_re = r"(?:" + double + "|" + single + "|" + bare + r"|[\"'][^\r\n]*)"
+field = re.compile(
+    r"(?<![a-z0-9_.?&\[-])(?P<prefix>(?P<name>[\"']?" + secret_name
+    + r"[\"']?)[ \t]*[:=][ \t]*)(?P<value>" + value_re + ")", re.I
+)
+php_define = re.compile(
+    r"(?P<prefix>\bdefine[ \t]*\([ \t]*[\"']" + secret_name
+    + r"[\"'][ \t]*,[ \t]*)(?P<value>" + value_re + ")", re.I
+)
+directive = re.compile(
+    r"(?P<prefix>(?<!\S)(?:requirepass|masterauth|AuthBasicPassword|"
+    r"auth_password|smtp_password|proxy_password)[ \t]+)(?P<value>"
+    + value_re + ")", re.I
+)
+long_arg = re.compile(
+    r"(?P<prefix>--(?:password|passwd|passphrase|token|api[-_]key|secret|"
+    r"client[-_]secret)[ \t]+)(?P<value>" + value_re + ")", re.I
+)
+mysql_arg = re.compile(r"(?P<prefix>(?<!\S)-p)(?P<value>" + value_re + ")")
+redis_arg = re.compile(r"(?P<prefix>(?<!\S)-a[ \t]+)(?P<value>" + value_re + ")")
+curl_user = re.compile(r"(?P<prefix>(?<!\S)(?:-u|--user)[ \t]+)(?P<value>" + value_re + ")")
+uri_auth = re.compile(r'([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@\s"<>]+)@')
+query = re.compile(r'([?&])([a-zA-Z0-9_.%+~-]+)=([^\s&"<>]*)')
+header = re.compile(
+    r"(?<![a-z0-9_.?&\[-])(?P<prefix>(?P<name>[\"']?(?:Authorization|"
+    r"Proxy-Authorization|Cookie|Set-Cookie|X-API-Key)[\"']?)[ \t]*:[ \t]*)"
+    r"(?P<value>" + double + "|" + single + r"|[^\r\n]*)", re.I
+)
+pem_begin = re.compile(r"-----BEGIN [A-Za-z0-9 -]*PRIVATE KEY-----")
+pem_end = re.compile(r"-----END [A-Za-z0-9 -]*PRIVATE KEY-----")
+wg_key = re.compile(r"(?P<prefix>(?:private key|preshared key):[ \t]*)(?P<value>[^\r\n]+)", re.I)
+auth_scheme = re.compile(r"(?i)(Bearer|Basic)[ \t]+([A-Za-z0-9_.+/=-]{10,})")
+known_tokens = [
+    re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
+    re.compile(r"(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{12,}"),
+    re.compile(r"sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{15,}|npm_[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{30,}"),
+    re.compile(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}"),
+]
+telegram = re.compile(r"(bot)([0-9]{6,}:[A-Za-z0-9_-]{25,})")
+
+def unwrap(raw, json_value=False):
+    # Strip only balanced outer quotes. Decode JSON escapes when the syntax
+    # explicitly indicates JSON. Do not evaluate shell/PHP expressions.
+    if len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0]:
+        if json_value and raw[0] == '"':
+            try:
+                data = json.loads(raw)
+                if isinstance(data, str):
+                    return data, raw[0]
+            except (ValueError, TypeError):
+                pass
+        return raw[1:-1], raw[0]
+    return raw, ""
+
+def field_value(match):
+    prefix = match.group("prefix")
+    name = match.groupdict().get("name") or ""
+    name = name.strip("\"'").lower()
+    raw = match.group("value")
+    is_json = bool(match.groupdict().get("name", "").startswith('"') and ":" in prefix)
+    value, quote = unwrap(raw, is_json)
+    if name in ("cookie", "set-cookie"):
+        tag = "[REDACTED]"
+    elif name in ("authorization", "proxy-authorization"):
+        parts = value.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() in ("bearer", "basic"):
+            tag = parts[0] + " " + emit_tag(parts[1])
+        else:
+            tag = emit_tag(value)
+    else:
+        tag = emit_tag(value)
+    return prefix + quote + tag + quote
+
+def uri_value(match):
+    userinfo = match.group(2)
+    if ":" in userinfo:
+        _, password = userinfo.split(":", 1)
+        return match.group(1) + "[REDACTED]:" + emit_tag(unquote(password, errors="surrogateescape")) + "@"
+    return match.group(1) + emit_tag(unquote(userinfo, errors="surrogateescape")) + "@"
+
+def query_value(match):
+    name = unquote_plus(match.group(2))
+    if secret_field.fullmatch(name):
+        return match.group(1) + match.group(2) + "=" + emit_tag(unquote_plus(match.group(3), errors="surrogateescape"))
+    return match.group(1) + "[REDACTED_QUERY]"
+
+def curl_value(match):
+    value, quote = unwrap(match.group("value"))
+    if ":" in value:
+        _, value = value.split(":", 1)
+    return match.group("prefix") + quote + emit_tag(value) + quote
+
+def redact(line):
+    # Collect matches on the ORIGINAL text. The leftmost outer match wins;
+    # once masked, its contents are never parsed again. This prevents a
+    # password containing ?x=y, a URL, or a token-shaped substring from
+    # getting modified before its fingerprint is computed.
+    rules = [
+        (header, field_value),
+        (php_define, field_value),
+        (directive, field_value),
+        (long_arg, field_value),
+        (uri_auth, uri_value),
+        (query, query_value),
+        (wg_key, field_value),
+        (field, field_value),
+        (auth_scheme, lambda m: m.group(1) + " " + emit_tag(m.group(2))),
+        (telegram, lambda m: m.group(1) + emit_tag(m.group(2))),
+        (existing_tag, lambda m: "[REDACTED_EXISTING_TAG]"),
+    ]
+    if re.search(r"\b(?:mysql|mysqldump|mariadb|mariadb-dump)\b", line):
+        rules.append((mysql_arg, field_value))
+    if re.search(r"\bredis-cli\b", line):
+        rules.append((redis_arg, field_value))
+    if re.search(r"\bcurl\b", line):
+        rules.append((curl_user, curl_value))
+    rules.extend((pattern, lambda m: emit_tag(m.group(0))) for pattern in known_tokens)
+    matches = []
+    for priority, (pattern, replace) in enumerate(rules):
+        for match in pattern.finditer(line):
+            matches.append((match.start(), priority, match.end(), match, replace))
+    matches.sort(key=lambda item: (item[0], item[1]))
+    cursor = 0
+    parts = []
+    for start, _, end, match, replace in matches:
+        if start < cursor:
+            continue
+        parts.append(line[cursor:start])
+        parts.append(replace(match))
+        cursor = end
+    parts.append(line[cursor:])
+    return "".join(parts)
+
+with open(sys.argv[1], "r", encoding="utf-8", errors="surrogateescape") as source, \
+     open(sys.argv[2], "w", encoding="utf-8", errors="surrogateescape") as target:
+    target.write("[SECRET MODE] HMAC-SHA256 tags: equal values match within this report only; not a validity check.\n")
+    skip = False
+    for line in source:
+        if pem_begin.search(line):
+            target.write("[REDACTED PRIVATE KEY BLOCK]\n")
+            skip = not bool(pem_end.search(line))
+            continue
+        if pem_end.search(line):
+            skip = False
+            continue
+        if not skip:
+            # Preserve original line ending; patterns should not swallow it.
+            text = line.rstrip("\r\n")
+            target.write(redact(text) + line[len(text):])
+PYTHON_SECRET_FILTER
+)
+
+redact_file_mask_only() {
+  local src="$1"
+  # Match named fields in ENV, INI, YAML, JSON and common config formats.
+  # Quoted strings (including escapes) must be handled before bare values.
+  local secret_name='([a-z0-9_.-]*[_-])?(password|passwd|pwd|pass|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|session[_-]?id|session[_-]?token|auth[_-]?token|access[_-]?token|refresh[_-]?token|authorization|credential(s)?|requirepass|key|dbpass|dbpassword|mysqlpwd|mysql_pwd|secretaccesskey)'
+  local prefix="((^|[^a-zA-Z0-9_.-])[\"']?${secret_name}[\"']?[[:space:]]*[:=][[:space:]]*)"
+  local dq='"([^"\\]|\\.)*"'
+  local sq="'([^'\\\\]|\\\\.)*'"
+  local bare="[^[:space:],;}\"'<>]+"
+  # Strip private-key blocks first; a log can embed the entire PEM on one line.
+  # Keep diagnostic lines outside the block and do not depend on Python.
+  awk '
+    /-----BEGIN [A-Za-z0-9 -]*PRIVATE KEY-----/ {
+      print "[REDACTED PRIVATE KEY BLOCK]"
+      skip=($0 !~ /-----END [A-Za-z0-9 -]*PRIVATE KEY-----/)
+      next
+    }
+    /-----END [A-Za-z0-9 -]*PRIVATE KEY-----/ {skip=0; next}
+    skip {next}
+    {print}
+  ' "$src" | sed -E \
+    -e "s/${prefix}${dq}/\\1\"[REDACTED]\"/gI" \
+    -e "s/${prefix}${sq}/\\1'[REDACTED]'/gI" \
+    -e "s/${prefix}${bare}/\\1[REDACTED]/gI" \
+    -e "s/(define[[:space:]]*\\([[:space:]]*[\"']${secret_name}[\"'][[:space:]]*,[[:space:]]*)(${dq}|${sq})/\\1'[REDACTED]'/gI" \
+    -e "s/((^|[[:space:]])(requirepass|masterauth|AuthBasicPassword|auth_password|smtp_password|proxy_password)[[:space:]]+)(${dq}|${sq}|${bare})/\\1[REDACTED]/gI" \
+    -e "s/(--(password|passwd|passphrase|token|api[-_]key|secret|client[-_]secret)[[:space:]]+)(${dq}|${sq}|${bare})/\\1[REDACTED]/gI" \
+    -e "/\\b(mysql|mysqldump|mariadb|mariadb-dump)\\b/ s/(^|[[:space:]])-p(${dq}|${sq}|${bare})/\\1-p[REDACTED]/g" \
+    -e "/\\bredis-cli\\b/ s/(^|[[:space:]])-a[[:space:]]+(${dq}|${sq}|${bare})/\\1-a [REDACTED]/g" \
+    -e "/\\bcurl\\b/ s/(^|[[:space:]])(-u|--user)[[:space:]]+(${dq}|${sq}|${bare})/\\1\\2 [REDACTED]/g" \
+    -e 's#([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@[:space:]"<>]+@#\1[REDACTED]@#g' \
+    -e 's#([?&])[a-zA-Z0-9_.%+~-]+=[^[:space:]&"<>]*#\1[REDACTED_QUERY]#g' \
+    -e "s/([\"']?(Authorization|Proxy-Authorization|Cookie|Set-Cookie|X-API-Key)[\"']?[[:space:]]*:[[:space:]]*).*/\\1[REDACTED]/gI" \
+    -e 's/(Bearer[[:space:]]+|Basic[[:space:]]+)[A-Za-z0-9_.+\/=-]{10,}/\1[REDACTED]/gI' \
+    -e 's/gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}/[REDACTED_GITHUB_TOKEN]/g' \
+    -e 's/(AKIA|ASIA)[0-9A-Z]{16}/[REDACTED_AWS_KEY]/g' \
+    -e 's/(sk|rk)_(live|test)_[A-Za-z0-9]{12,}/[REDACTED_PAYMENT_KEY]/g' \
+    -e 's/(sk-(proj-|svcacct-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,})/[REDACTED_API_KEY]/g' \
+    -e 's/xox[baprs]-[A-Za-z0-9-]{15,}|npm_[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{30,}/[REDACTED_TOKEN]/g' \
+    -e 's/bot[0-9]{6,}:[A-Za-z0-9_-]{25,}/bot[REDACTED]/g' \
+    -e 's/(private key:[[:space:]]*|preshared key:[[:space:]]*)[^[:space:]].*/\1[REDACTED]/gI' \
+    -e 's/eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}/[REDACTED_JWT]/g'
 }
 
 # ---------- Incident diagnostics (also works with panel-installed binaries) ----------
@@ -126,19 +360,74 @@ audit_number() {
 AUDIT_TIMEOUT=$(audit_number "${AUDIT_TIMEOUT:-12}" 12 120)
 AUDIT_HISTORY_DAYS=$(audit_number "${AUDIT_HISTORY_DAYS:-7}" 7 90)
 AUDIT_LOG_LINES=$(audit_number "${AUDIT_LOG_LINES:-20}" 20 100)
-AUDIT_MAX_SITES=$(audit_number "${AUDIT_MAX_SITES:-12}" 12 100)
+AUDIT_MAX_SITES=$(audit_number "${AUDIT_MAX_SITES:-30}" 30 100)
+AUDIT_HTTP_BUDGET=$(audit_number "${AUDIT_HTTP_BUDGET:-120}" 120 900)
 AUDIT_MAX_FILES=$(audit_number "${AUDIT_MAX_FILES:-20}" 20 100)
 AUDIT_BOT_FILES=$(audit_number "${AUDIT_BOT_FILES:-12}" 12 60)
 AUDIT_BOT_LINES=$(audit_number "${AUDIT_BOT_LINES:-2500}" 2500 10000)
 AUDIT_REPORT_LINES=$(audit_number "${AUDIT_REPORT_LINES:-5000}" 5000 20000)
 AUDIT_DOMAIN="${AUDIT_DOMAIN:-}"
 audit_domain_ok() {
-  [[ "$1" =~ ^[[:alnum:]]([[:alnum:].-]*[[:alnum:]])?$ && "$1" == *.* && ${#1} -le 253 ]]
+  # HTTP Host/SNI needs an actual DNS hostname, not a wildcard, literal IP,
+  # placeholder, regex server_name or path. IDNs use their ASCII punycode form.
+  [[ "$1" =~ ^([[:alnum:]]([[:alnum:]-]{0,61}[[:alnum:]])?\.)+[[:alnum:]]([[:alnum:]-]{0,61}[[:alnum:]])?$ &&
+     ! "$1" =~ ^[0-9]+(\.[0-9]+){3}$ && ${#1} -le 253 ]]
 }
 if [ -n "$AUDIT_DOMAIN" ] && ! audit_domain_ok "$AUDIT_DOMAIN"; then
   echo "[!] AUDIT_DOMAIN invalid; use a hostname without scheme, path or port." >&2
   exit 2
 fi
+AUDIT_DOMAIN=${AUDIT_DOMAIN,,}
+
+audit_site_order() {
+  # Read rows "primary name", "alias name", "target name". Deduplicate,
+  # put explicit target first, then primary vhosts and shallower names.
+  local role name priority labels
+  while read -r role name; do
+    name=${name%;}
+    name=${name#\"}; name=${name%\"}
+    name=${name%.}; name=${name,,}
+    audit_domain_ok "$name" || continue
+    printf '%s %s\n' "$role" "$name"
+  done | awk '
+    {p=($1=="target"?0:($1=="primary"?1:2)); if(!($2 in rank)||p<rank[$2])rank[$2]=p}
+    END{
+      for(d in rank) {
+        if(d ~ /^www\./ && substr(d,5) in rank && rank[substr(d,5)] > rank[d])
+          rank[substr(d,5)]=rank[d]==0?1:rank[d]
+      }
+      for(d in rank){tmp=d; labels=gsub(/\./,".",tmp); printf "%d\t%d\t%s\n",rank[d],labels,d}
+    }' | sort -t $'\t' -k1,1n -k2,2n -k3,3 | cut -f3
+}
+audit_nginx_site_records() {
+  awk '$2=="server_name" {
+    found=0
+    for(i=3;i<=NF;i++){
+      n=$i; ending=(n~/;/); sub(/;.*/,"",n); gsub(/"/,"",n)
+      if(n ~ /^[[:alnum:]][[:alnum:].-]*\.[[:alnum:].-]+$/ && n !~ /^[0-9.]+$/)
+        print (found++==0?"primary":"alias"),n
+      if(ending)break
+    }
+  }'
+}
+audit_apache_site_records() {
+  awk '{
+    for(i=1;i<NF;i++){
+      if($i=="namevhost"){print "primary",$(i+1);break}
+      if($i=="default" && $(i+1)=="server" && i+2<=NF){print "primary",$(i+2);break}
+      if($i=="alias"){print "alias",$(i+1);break}
+      if($i=="wild" && $(i+1)=="alias")break
+    }
+  }'
+}
+audit_ols_site_records() {
+  awk 'tolower($1)=="map" {
+    n=0; for(i=3;i<=NF;i++){m=split($i,a,",");for(j=1;j<=m;j++)if(a[j]!="")print (n++==0?"primary":"alias"),a[j]}
+  }
+  tolower($1)=="vhdomain" {print "primary",$2}
+  tolower($1)=="vhaliases" {for(i=2;i<=NF;i++){m=split($i,a,",");for(j=1;j<=m;j++)if(a[j]!="")print "alias",a[j]}}'
+}
+
 audit_detect() {
   NGINX_BIN=$(audit_bin /www/server/nginx/sbin/nginx nginx /usr/sbin/nginx || true)
   APACHE_BIN=$(audit_bin /www/server/apache/bin/apachectl /usr/local/apache/bin/apachectl /usr/sbin/apachectl apache2ctl apachectl || true)
@@ -333,21 +622,67 @@ audit_upstream() {
       else echo "$target => dynamic/named/remote upstream; not assumed broken"; fi ;;
   esac
 }
+audit_http_classify() {
+  local code="$1" rc="$2"
+  if [ "$rc" != 0 ]; then
+    case "$rc" in
+      6) echo "DNS FAILURE";; 7) echo "CONNECT FAILURE";;
+      28|124|137) echo "TIMEOUT";; 35|51|60) echo "TLS FAILURE";;
+      *) echo "TRANSPORT ERROR (curl/timeout exit=$rc)";;
+    esac
+  else
+    case "$code" in
+      2??) echo "OK (HTTP response)";;
+      3??) echo "REDIRECT (destination not checked)";;
+      401|403) echo "ACCESS RESTRICTED";;
+      404) echo "NOT FOUND";;
+      4??) echo "CLIENT/HTTP ERROR";;
+      5??) echo "SERVER ERROR";;
+      *) echo "UNKNOWN HTTP STATUS";;
+    esac
+  fi
+}
 audit_http() {
   local label="$1" scheme="$2" domain="$3" ip="$4" port="$5"
-  # --connect-to preserves the original Host and TLS SNI. No redirects,
-  # no external proxy, no response body/cookies, no credentials.
-  local original=80
+  local original=80 result rc code
+  local args=(curl -q --noproxy '*' -sS --connect-timeout 2 --max-time 5)
   [ "$scheme" = https ] && original=443
-  printf '%s %s://%s/ via %s:%s => ' "$label" "$scheme" "$domain" "$ip" "$port"
-  audit_cmd curl -q --noproxy '*' -ksS --connect-timeout 2 --max-time 5 --connect-to "$domain:$original:$ip:$port" -o /dev/null -w 'HTTP %{http_code} connect=%{time_connect}s total=%{time_total}s\n' "$scheme://$domain/" 2>&1 | cut -c1-350
+  if [ "$label" = PUBLIC ]; then
+    # Real DNS/CDN path; verification remains enabled.
+    printf '%s %s://%s/ => ' "$label" "$scheme" "$domain"
+  else
+    # Preserve Host and TLS SNI while testing the local origin.
+    args+=(-k --connect-to "$domain:$original:$ip:$port")
+    printf '%s %s://%s/ via %s:%s => ' "$label" "$scheme" "$domain" "$ip" "$port"
+  fi
+  result=$(audit_cmd "${args[@]}" -o /dev/null -w 'HTTP %{http_code} remote=%{remote_ip} connect=%{time_connect}s total=%{time_total}s\n' "$scheme://$domain/" 2>&1); rc=$?
+  code=$(printf '%s\n' "$result" | sed -nE 's/^HTTP ([0-9]{3}).*/\1/p' | tail -n1)
+  printf '%s [%s]\n' "$(printf '%s' "$result" | tr '\r\n' ' ' | cut -c1-350)" "$(audit_http_classify "${code:-000}" "$rc")"
 }
+audit_front_address() {
+  local port="$1" address
+  if [[ "$(audit_local_port_status 127.0.0.1 "$port")" == LISTENER* ]]; then
+    echo 127.0.0.1; return 0
+  fi
+  # Some panels bind public/local interface addresses instead of loopback.
+  # Only choose an address reported as a local listener, never DNS resolution.
+  address=$(printf '%s\n' "$TCP_LISTEN" | awk -v p="$port" '$4~(":"p"$"){a=$4;sub(":"p"$","",a);if(a!="*"&&a!="0.0.0.0"&&a!="[::]"){print a;exit}}')
+  if [[ "$address" =~ ^[0-9]+(\.[0-9]+){3}$ || "$address" =~ ^\[[0-9a-fA-F:]+\]$ ]]; then
+    printf '%s\n' "$address"
+  else
+    return 1
+  fi
+}
+
 audit_config_lines() {
   # Do not dump whole configs (they can hold secrets). Source markers from
   # nginx -T associate directives with real included files.
   awk '
-    /^# configuration file .*:$/ { src=$0; sub(/^# configuration file /,"",src); sub(/:$/,"",src); next }
+    /^# configuration file .*:$/ { src=$0; sub(/^# configuration file /,"",src); sub(/:$/,"",src); pending=""; next }
     { line=$0; sub(/^[[:space:]]*/,"",line); if(line ~ /^#/)next
+      sub(/[[:space:]]+#.*/,"",line)
+      if(pending!=""){ pending=pending " " line; if(pending !~ /;/)next; line=pending; pending="" }
+      else if(line ~ /^server_name[[:space:]]/ && line !~ /;/){pending=line;next}
       if(line ~ /^(server_name|listen|proxy_pass|fastcgi_pass|uwsgi_pass|scgi_pass|grpc_pass|upstream|server|error_log|access_log|include|limit_req|limit_req_zone|limit_conn|limit_conn_zone)[[:space:]]/){
         # Strip URL userinfo/query strings; never expose request headers.
         sub(/[[:space:]]+#.*/,"",line); gsub(/\?[^;[:space:]]+/,"?[REDACTED]",line)
@@ -361,8 +696,8 @@ audit_web() {
   [ "$TCP_OK" = 0 ] && { TCP_OK=1; printf '%s\n' "$TCP_LISTEN" | head -n 70; } || { TCP_OK=0; printf '%s\n' "$TCP_LISTEN" | head -n 3; }
   UNIX_LISTEN=$(audit_cmd ss -H -lxnp 2>&1); UNIX_OK=$?
   [ "$UNIX_OK" = 0 ] && { UNIX_OK=1; printf '%s\n' "$UNIX_LISTEN" | grep -Ei 'php|nginx|apache|httpd|lsws|mysql|redis' | head -n 50; } || { UNIX_OK=0; echo "Unix listeners unavailable"; }
-  local ng="" routes="" apache_sites="" f d target s p
-  local domains=() targets=() files=()
+  local ng="" routes="" apache_sites="" records="" f d target s p
+  local targets=()
   if [ -n "$NGINX_BIN" ]; then
     audit_exec "$NGINX_BIN" -v
     audit_exec "$NGINX_BIN" -t
@@ -370,7 +705,8 @@ audit_web() {
     ng=$(audit_cmd "$NGINX_BIN" -T 2>/dev/null); local rc=$?
     if [ "$rc" -ne 0 ]; then echo "[!] nginx -T unavailable (exit=$rc); reading known vhost files instead."; fi
     routes=$(printf '%s\n' "$ng" | audit_config_lines)
-    if [ -z "$routes" ]; then
+    if [ -z "$routes" ] || [ "$rc" -ne 0 ]; then
+      routes+=$'\n'
       for f in /www/server/panel/vhost/nginx/*.conf /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
         [ -f "$f" ] || continue
         routes+=$( { printf '# configuration file %s:\n' "$f"; cat "$f"; } | audit_config_lines)
@@ -392,15 +728,25 @@ audit_web() {
         printf '%s\n' "$routes" | awk -v t="$target" '$3==t {print "  referenced:",$0}' | head -n 4 | cut -c1-400
       fi
     done
-    mapfile -t domains < <(printf '%s\n' "$routes" | awk '$2=="server_name" {for(i=3;i<=NF;i++){sub(/;$/,"",$i);print $i}}' | sort -u)
+    records+=$(printf '%s\n' "$routes" | audit_nginx_site_records)
+    records+=$'\n'
   fi
   if [ -n "$APACHE_BIN" ]; then
     echo "--- Apache ($APACHE_BIN) ---"
     audit_exec "$APACHE_BIN" -v
     audit_exec "$APACHE_BIN" -t
-    apache_sites=$(audit_cmd "$APACHE_BIN" -S 2>&1)
+    apache_sites=$(audit_cmd "$APACHE_BIN" -S 2>&1); local apache_rc=$?
     printf '%s\n' "$apache_sites" | head -n 100 | cut -c1-1000
-    while IFS= read -r d; do domains+=("$d"); done < <(printf '%s\n' "$apache_sites" | sed -nE 's/.*(namevhost|default server) ([^ ]+).*/\2/p' | sort -u)
+    records+=$(printf '%s\n' "$apache_sites" | audit_apache_site_records)
+    records+=$'\n'
+    if [ "$apache_rc" -ne 0 ]; then
+      echo "[!] Apache -S incomplete; reading known vhost paths (on-disk candidates)."
+      records+=$(for f in /www/server/panel/vhost/apache/*.conf /etc/apache2/sites-enabled/* /etc/httpd/conf.d/*.conf /var/www/vhosts/system/*/conf/httpd.conf /etc/apache2/conf/httpd.conf /usr/local/apache/conf/httpd.conf; do
+        [ -f "$f" ] || continue
+        awk 'tolower($1)=="servername"{print "primary",$2} tolower($1)=="serveralias"{for(i=2;i<=NF;i++)print "alias",$i}' "$f"
+      done)
+      records+=$'\n'
+    fi
     # Select active config paths only; don't recurse into .bak/original.
     for f in /www/server/apache/conf/httpd.conf /www/server/apache/conf/extra/httpd-mpm.conf /etc/apache2/ports.conf /etc/apache2/mods-enabled/mpm*.conf /etc/httpd/conf/httpd.conf /etc/httpd/conf.modules.d/*mpm*.conf; do
       [ -f "$f" ] || continue
@@ -414,39 +760,64 @@ audit_web() {
       [ -f "$f" ] || continue
       grep -HiE '^[[:space:]]*(include|listener|address|secure|map)[[:space:]]' "$f" | head -n 20 | cut -c1-600
     done | head -n 60
-    while IFS= read -r d; do domains+=("$d"); done < <(
-      for f in /usr/local/lsws/conf/httpd_config.conf /www/server/panel/vhost/openlitespeed/listen/*.conf; do
-        [ -f "$f" ] && awk '$1=="map"{print $3}' "$f" | tr ',' '\n'
-      done | sort -u
-    )
+    records+=$(for f in /usr/local/lsws/conf/httpd_config.conf /www/server/panel/vhost/openlitespeed/listen/*.conf /www/server/panel/vhost/openlitespeed/detail/*.conf /usr/local/lsws/conf/vhosts/*/vhconf.conf; do
+        [ -f "$f" ] && audit_ols_site_records < "$f"
+      done)
+    records+=$'\n'
     for f in /usr/local/lsws/conf/httpd_config.conf /usr/local/lsws/conf/httpd_config.conf.txt /www/server/panel/vhost/openlitespeed/listen/*.conf; do
       [ -f "$f" ] && stat -c '%y %n' "$f"
     done | head -n 25
   fi
-  if [ -n "$AUDIT_DOMAIN" ]; then domains=("$AUDIT_DOMAIN" "${domains[@]}"); fi
-  if [ "${SKIP_HTTP:-0}" != 1 ] && has curl && [ "$TCP_OK" = 1 ]; then
-    echo "--- local HTTP GET checks (no redirects; local TLS verification disabled for routing test) ---"
-    local seen=" " count=0
-    for d in "${domains[@]}"; do
-      audit_domain_ok "$d" || continue
-      [[ "$seen" == *" $d "* ]] && continue
-      seen+="$d "
-      ((count+=1)); [ "$count" -le "$AUDIT_MAX_SITES" ] || { echo "[!] site probe cap reached ($AUDIT_MAX_SITES); set AUDIT_DOMAIN to prioritize a site."; break; }
-      # Only probe bound standard front ports. Backend tests use static
-      # loopback HTTP(S) destinations associated with the same config file.
-      for s in http https; do
-        p=80; [ "$s" = https ] && p=443
-        if [[ "$(audit_local_port_status 127.0.0.1 "$p")" == LISTENER* ]]; then audit_http FRONT "$s" "$d" 127.0.0.1 "$p"; fi
-      done
-      while IFS= read -r target; do
-        if [[ "$target" =~ ^(https?)://(127\.0\.0\.1|localhost):([0-9]{1,5})(/)?\;?$ ]]; then
-          s="${BASH_REMATCH[1]}"; p="${BASH_REMATCH[3]}"
-          if [[ "$(audit_local_port_status 127.0.0.1 "$p")" == LISTENER* ]]; then audit_http BACKEND "$s" "$d" 127.0.0.1 "$p"; fi
-        fi
-      done < <(printf '%s\n' "$routes" | awk -v d="$d" '$2=="server_name" {for(i=3;i<=NF;i++){name=$i;sub(/;$/,"",name);if(name==d){src=$1;sub(/:[0-9]+$/,"",src);files[src]=1}}} $2=="proxy_pass" {src=$1;sub(/:[0-9]+$/,"",src);rows[++n]=src;dest[n]=$3} END{for(i=1;i<=n;i++)if(files[rows[i]])print dest[i]}' | sort -u | head -n 4)
-    done
-    echo "403/redirect alone is not proof of a bad backend; compare routing, logs and application response."
-  else echo "Local HTTP probes skipped (SKIP_HTTP=1 or missing curl/ss)."; fi
+  [ -n "$AUDIT_DOMAIN" ] && records+="target $AUDIT_DOMAIN"$'\n'
+  # Retain the same complete inventory for later DNS checks; no second dump.
+  mapfile -t AUDIT_DISCOVERED_DOMAINS < <(printf '%s\n' "$records" | audit_site_order)
+  echo "--- SITE INVENTORY (configured hostnames, not proof of live DNS) ---"
+  printf 'Discovered %s unique hostnames (including explicit target, if set).\n' "${#AUDIT_DISCOVERED_DOMAINS[@]}"
+  for d in "${AUDIT_DISCOVERED_DOMAINS[@]}"; do printf 'SITE %s\n' "$d"; done
+  echo "--- HTTP GET results (local origin; no redirects; local TLS verification disabled) ---"
+  local count=0 skipped=0 start_seconds=$SECONDS front_ip backend_status
+  for d in "${AUDIT_DISCOVERED_DOMAINS[@]}"; do
+    if [ "${SKIP_HTTP:-0}" = 1 ] || ! has curl; then
+      echo "SITE $d => NOT CHECKED (SKIP_HTTP=1 or missing curl)"
+    elif [ "$TCP_OK" != 1 ] && { [ "${SKIP_NET:-0}" = 1 ] || { [ "$d" != "$AUDIT_DOMAIN" ] && [ "${AUDIT_PUBLIC_HTTP:-0}" != 1 ]; }; }; then
+      echo "SITE $d => NOT CHECKED (ss unavailable; public check disabled)"
+    elif ((count >= AUDIT_MAX_SITES)); then
+      echo "SITE $d => NOT CHECKED (site probe cap $AUDIT_MAX_SITES)"
+    elif ((SECONDS - start_seconds >= AUDIT_HTTP_BUDGET)); then
+      echo "SITE $d => NOT CHECKED (HTTP time budget ${AUDIT_HTTP_BUDGET}s)"
+    else
+      ((count+=1))
+      if [ "$TCP_OK" != 1 ]; then
+        echo "SITE $d => LOCAL CHECK UNAVAILABLE (ss unavailable)"
+      else
+        for s in http https; do
+          p=80; [ "$s" = https ] && p=443
+          if front_ip=$(audit_front_address "$p"); then
+            audit_http FRONT "$s" "$d" "$front_ip" "$p"
+          else
+            echo "FRONT $s://$d/ => NO LOCAL LISTENER on port $p"
+          fi
+        done
+        while IFS= read -r target; do
+          if [[ "$target" =~ ^(https?)://(127\.0\.0\.1|localhost):([0-9]{1,5})(/)?\;?$ ]]; then
+            s="${BASH_REMATCH[1]}"; p="${BASH_REMATCH[3]}"
+            backend_status=$(audit_local_port_status 127.0.0.1 "$p")
+            if [[ "$backend_status" == LISTENER* ]]; then audit_http BACKEND "$s" "$d" 127.0.0.1 "$p"
+            else echo "BACKEND $s://$d/ via 127.0.0.1:$p => $backend_status"; fi
+          fi
+        done < <(printf '%s\n' "$routes" | awk -v d="$d" '$2=="server_name" {for(i=3;i<=NF;i++){name=tolower($i);ending=(name~/;/);sub(/;.*/,"",name);gsub(/"/,"",name);sub(/\.$/,"",name);if(name==d){src=$1;sub(/:[0-9]+$/,"",src);files[src]=1}if(ending)break}} $2=="proxy_pass" {src=$1;sub(/:[0-9]+$/,"",src);rows[++n]=src;dest[n]=$3} END{for(i=1;i<=n;i++)if(files[rows[i]])print dest[i]}' | sort -u | head -n 4)
+      fi
+      if [ "${SKIP_NET:-0}" != 1 ] && { [ "$d" = "$AUDIT_DOMAIN" ] || [ "${AUDIT_PUBLIC_HTTP:-0}" = 1 ]; }; then
+        audit_http PUBLIC https "$d" "" 443
+      fi
+      continue
+    fi
+    ((skipped+=1))
+  done
+  echo "SITE SUMMARY: discovered=${#AUDIT_DISCOVERED_DOMAINS[@]} selected=$count skipped=$skipped (HTTP results are point-in-time, not full application health)."
+  ((skipped==0)) || echo "[!] Raise AUDIT_MAX_SITES/AUDIT_HTTP_BUDGET or set AUDIT_DOMAIN to prioritize specific names."
+  echo "403/redirect/HTTP 200 alone is not proof of backend health; compare routing, logs and application response."
+
 }
 audit_logs() {
   sep "INCIDENT — WEB / PHP / DB ERROR LOGS"
@@ -589,7 +960,7 @@ audit_access_sample() {
 
 main_audit() {
 audit_detect
-echo "SERVER AUDIT REPORT v2"
+echo "SERVER AUDIT REPORT v3"
 echo "History: last $AUDIT_HISTORY_DAYS days, current and previous retained boot; target: ${AUDIT_DOMAIN:-auto}"
 echo "Host: $(hostname)   Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 echo "===================================================="
@@ -983,31 +1354,15 @@ if [ "${SKIP_NET:-0}" != "1" ]; then
     [ -z "$SERVER_PUBLIC_IP" ] && SERVER_PUBLIC_IP=$(curl -q -s --max-time 5 https://ifconfig.me 2>/dev/null || true)
   fi
   echo "Внешний IP сервера (определён автоматически): ${SERVER_PUBLIC_IP:-не удалось определить}"
-  if [ -n "$AUDIT_DOMAIN" ] && [ "${SKIP_HTTP:-0}" != 1 ] && has curl; then
-    echo "--- Target external HTTPS (DNS/CDN path, certificate verified, no redirects) ---"
-    audit_cmd curl -q --noproxy '*' -sS -o /dev/null --connect-timeout 3 --max-time 8 -w 'HTTP %{http_code} remote=%{remote_ip} total=%{time_total}s\n' "https://$AUDIT_DOMAIN/"
-  fi
   echo
-
-  DOMAINS=""
-  if [ -n "$NGINX_BIN" ]; then
-    DOMAINS="$DOMAINS $(audit_cmd "$NGINX_BIN" -T 2>/dev/null | grep -E '^\s*server_name\s' | sed -E 's/^\s*server_name\s+//; s/;\s*$//' | tr ' ' '\n')"
-  fi
-  if [ -n "$APACHE_BIN" ]; then
-    DOMAINS="$DOMAINS $(audit_cmd "$APACHE_BIN" -S 2>&1 | grep -oE 'namevhost [^ ]+' | awk '{print $2}')"
-    DOMAINS="$DOMAINS $(grep -rhoE '^\s*ServerAlias\s+.*' /etc/apache2/sites-enabled /etc/httpd/conf.d 2>/dev/null | sed -E 's/^\s*ServerAlias\s+//')"
-  fi
-  [ -n "$AUDIT_DOMAIN" ] && DOMAINS="$AUDIT_DOMAIN $DOMAINS"
-  DOMAINS=$(printf '%s\n' "$DOMAINS" | tr '[:space:]' '\n' | sed '/^$/d' | grep -vE '^(_|\*|localhost)$' | sort -u)
-
-  if [ -n "$DOMAINS" ]; then
+  if ((${#AUDIT_DISCOVERED_DOMAINS[@]})); then
     echo "DNS проверяет максимум $AUDIT_MAX_SITES имён; отдельно укажите AUDIT_DOMAIN."
-    echo "Найдено доменов в конфигах веб-сервера: $(printf '%s\n' "$DOMAINS" | wc -l)"
+    echo "Найдено доменов в конфигах веб-сервера: ${#AUDIT_DISCOVERED_DOMAINS[@]}"
     echo "(если домен идёт через Cloudflare/другой CDN/прокси — несовпадение IP это нормально, не ошибка)"
     echo
     printf '%-35s %-18s %s\n' "DOMAIN" "A-RECORD" "STATUS"
     checked=0
-    { printf '%s\n' "$AUDIT_DOMAIN"; printf '%s\n' "$DOMAINS"; } | awk 'NF&&!seen[$0]++' | while IFS= read -r d; do
+    printf '%s\n' "${AUDIT_DISCOVERED_DOMAINS[@]}" | while IFS= read -r d; do
       audit_domain_ok "$d" || continue
       ((checked+=1)); [ "$checked" -le "$AUDIT_MAX_SITES" ] || break
       if has dig; then
@@ -1027,7 +1382,7 @@ if [ "${SKIP_NET:-0}" != "1" ]; then
       printf '%-35s %-18s %s\n' "$d" "${resolved:--}" "$status"
     done
   else
-    echo "Домены в конфигах nginx/apache не найдены (server_name/ServerName не заданы или веб-сервер не установлен)."
+    echo "Домены в известных конфигах веб-сервера не найдены; нестандартные конфигурации могут требовать отдельной проверки."
   fi
 else
   echo "Пропущено (SKIP_NET=1)"
@@ -1219,11 +1574,11 @@ echo "Сбор данных завершён."
 echo "===================================================="
 }
 
-# ---------- Сбор во временный буфер (никогда не остаётся на диске сервера) ----------
+# ---------- Сбор во временный буфер (удаляется при штатном выходе) ----------
 AUDIT_TMP=$(mktemp -d "${TMPDIR:-/tmp}/server-audit.XXXXXXXX") || exit 1
 RAW="$AUDIT_TMP/raw"
 FINAL="$AUDIT_TMP/final"
-cleanup() { rm -f -- "$RAW" "$FINAL"; rmdir -- "$AUDIT_TMP" 2>/dev/null || true; }
+cleanup() { rm -f -- "$RAW" "$FINAL" "$AUDIT_TMP/paste-delete-status"; rmdir -- "$AUDIT_TMP" 2>/dev/null || true; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -1244,6 +1599,8 @@ if ! redact_file "$RAW" "$FINAL"; then
   echo "[!] Report redaction failed; raw report will not be printed." >&2
   exit 1
 fi
+# Never keep the unfiltered report while waiting for user input or deletion.
+rm -f -- "$RAW" || echo "[!] Не удалось сразу удалить временный исходный отчёт." >&2
 
 echo
 echo "===================================================="
@@ -1256,7 +1613,7 @@ echo "Конец отчёта. Если терминал обрезает его
 echo "прокрутки в PuTTY/MobaXterm/Termius) — надёжный способ получить отчёт"
 echo "целиком: запустите эту же команду с ЛОКАЛЬНОГО терминала (не внутри"
 echo "уже открытой сессии на сервере) с перенаправлением в файл у себя:"
-echo "  ssh root@IP_СЕРВЕРА 'curl -fsSL https://raw.githubusercontent.com/lyfreedomitsme/server-audit/main/server_audit.sh | bash' > report.txt"
+echo "  ssh root@IP_СЕРВЕРА 'curl -fsSL https://raw.githubusercontent.com/lyfreedomitsme/server-audit/main/server_audit.sh | PASTE=0 bash' > report.txt"
 echo "Файл report.txt появится у вас на компьютере целиком, без обрезаний."
 echo "===================================================="
 
@@ -1270,7 +1627,7 @@ if [ "${SKIP_NET:-0}" != 1 ]; then
     *)
       if [ -t 1 ] && ( : </dev/tty ) 2>/dev/null; then
         echo "[!] Опубликовать отчёт на termbin.com? Ссылка публичная, без пароля."
-        echo "Запланирована попытка удаления через ${PASTE_TTL:-15} сек. Удаление не гарантировано."
+        echo "Запланировано удаление и проверка доступности ссылки. Гарантии конфиденциальности нет."
         echo "Отчёт может содержать IP, домены, логи и нераспознанные секреты."
         printf 'y/N: '
         answer=""
@@ -1280,28 +1637,72 @@ if [ "${SKIP_NET:-0}" != 1 ]; then
   esac
 fi
 if [ "$DO_PASTE" = 1 ]; then
-  if has nc && has timeout; then
+  # Termbin allows self-service deletion for ten minutes. Leave time for retries.
+  ttl=$(audit_number "${PASTE_TTL:-15}" 15 540)
+  if [ "${PASTE_TTL:-15}" = 0 ]; then ttl=0; fi
+  if ! has nc || ! has timeout; then
+    echo "[!] nc/timeout unavailable; public upload skipped."
+  elif [ "$ttl" != 0 ] && { ! has curl || { ! has setsid && ! has nohup; }; }; then
+    echo "[!] Для проверяемого удаления нужны curl и setsid/nohup. Публикация отменена."
+  else
     # Use the exact capped, redacted report shown above; no raw upload.
     PASTE_URL=$(head -n "$AUDIT_REPORT_LINES" "$FINAL" | timeout -k 2s 15s nc termbin.com 9999 2>/dev/null | tr -d '\000\r\n' | head -c 200)
     if [[ "$PASTE_URL" =~ ^https://termbin\.com/([A-Za-z0-9_-]{1,80})$ ]]; then
       slug="${BASH_REMATCH[1]}"
       echo "Ссылка: $PASTE_URL"
-      echo "[!] Ссылка публичная; гарантировать удаление и истечение срока мы не можем."
-      echo "Попытка ручного удаления (с того же IP):"
-      printf '  curl -X POST "https://termbin.com/delete?slug=%s"\n' "$slug"
-      ttl=$(audit_number "${PASTE_TTL:-15}" 15 86400)
-      if [ "${PASTE_TTL:-15}" = 0 ]; then ttl=0; fi
+      echo "[!] Ссылка публичная; данные уже переданы стороннему сервису."
+      echo "Ручное удаление (с того же IP):"
+      printf '  curl -q --noproxy "*" -fsS -X POST "https://termbin.com/delete?slug=%s"\n' "$slug"
       if [ "$ttl" = 0 ]; then
         echo "[!] Автоматическое удаление отключено (PASTE_TTL=0)."
-      elif has curl && (has setsid || has nohup); then
-        echo "[*] Попытка автоматического удаления через $ttl сек. Успейте скопировать ссылку."
-        delete_runner=setsid
-        has setsid || delete_runner=nohup
-        "$delete_runner" bash -c 'sleep "$1"; curl -q -fsS --max-time 10 -X POST "https://termbin.com/delete?slug=$2" >/dev/null 2>&1' bash "$ttl" "$slug" </dev/null >/dev/null 2>&1 &
-        disown 2>/dev/null || true
       else
-        echo "[!] Не удалось запланировать автоудаление: отсутствуют curl/setsid/nohup. Используйте команду выше."
+        echo "[*] Через $ttl сек. начнётся удаление. Откройте ссылку и скопируйте отчёт сейчас."
+        # Detached worker: it does not need the raw report, or an open SSH/TTY.
+        # Its output is captured privately and displayed by the waiting parent.
+        # A GET with 404/410 confirms only that the original URL is unavailable
+        # at the moment of the check, not that backups/copies were erased.
+        delete_code=$(cat <<'DELETE_WORKER'
+set -u
+sleep "$1"
+slug="$2"
+url="https://termbin.com/$slug"
+delete_url="https://termbin.com/delete?slug=$slug"
+http_code() {
+  curl -q --noproxy '*' --proto '=https' -sS --connect-timeout 4 --max-time 8 \
+    -o /dev/null -w '%{http_code}' "$@" 2>/dev/null
+}
+for attempt in 1 2 3; do
+  post=$(http_code -X POST "$delete_url") || post=000
+  get=$(http_code -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$url") || get=000
+  case "$get" in
+    404|410)
+      printf '[OK] Ссылка недоступна (HTTP %s; попытка %s/3, POST %s).\n' "$get" "$attempt" "$post"
+      exit 0 ;;
+  esac
+  printf '[!] Попытка %s/3: POST %s, GET %s.\n' "$attempt" "$post" "$get"
+  if [ "$attempt" -lt 3 ]; then sleep "$((attempt * 2))"; fi
+done
+echo '[!] Удаление НЕ подтверждено. Ссылка может оставаться доступной. Используйте команду ручного удаления выше.'
+exit 1
+DELETE_WORKER
+)
+        status_file="$AUDIT_TMP/paste-delete-status"
+        if has setsid && setsid --help 2>&1 | grep -q -- '--wait'; then
+          setsid --wait bash -c "$delete_code" bash "$ttl" "$slug" </dev/null >"$status_file" 2>&1 &
+        elif has nohup; then
+          nohup bash -c "$delete_code" bash "$ttl" "$slug" </dev/null >"$status_file" 2>&1 &
+        else
+          # Some BusyBox versions have setsid but lack --wait. With job
+          # control disabled, this child is not a process group leader.
+          setsid bash -c "$delete_code" bash "$ttl" "$slug" </dev/null >"$status_file" 2>&1 &
+        fi
+        delete_pid=$!
+        wait "$delete_pid" || true
+        if [ -s "$status_file" ]; then cat "$status_file"
+        else echo "[!] Не удалось получить результат проверки. Удаление не подтверждено."; fi
       fi
-    else echo "[!] Upload response missing/unexpected; use the local report."; fi
-  else echo "[!] nc/timeout unavailable; public upload skipped."; fi
+    else
+      echo "[!] Нет корректной ссылки от Termbin. Публикация могла состояться; удалить неизвестный URL нельзя. Используйте локальный отчёт."
+    fi
+  fi
 fi
