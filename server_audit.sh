@@ -960,7 +960,7 @@ audit_access_sample() {
 
 main_audit() {
 audit_detect
-echo "SERVER AUDIT REPORT v3"
+echo "SERVER AUDIT REPORT v3.1"
 echo "History: last $AUDIT_HISTORY_DAYS days, current and previous retained boot; target: ${AUDIT_DOMAIN:-auto}"
 echo "Host: $(hostname)   Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 echo "===================================================="
@@ -1578,7 +1578,7 @@ echo "===================================================="
 AUDIT_TMP=$(mktemp -d "${TMPDIR:-/tmp}/server-audit.XXXXXXXX") || exit 1
 RAW="$AUDIT_TMP/raw"
 FINAL="$AUDIT_TMP/final"
-cleanup() { rm -f -- "$RAW" "$FINAL" "$AUDIT_TMP/paste-delete-status"; rmdir -- "$AUDIT_TMP" 2>/dev/null || true; }
+cleanup() { rm -f -- "$RAW" "$FINAL" "$AUDIT_TMP/paste-delete-status" "$AUDIT_TMP/paste-payload" "$AUDIT_TMP/paste-compact" "$AUDIT_TMP/paste-response" "$AUDIT_TMP/paste-nc-error" "$AUDIT_TMP/paste-received"; rmdir -- "$AUDIT_TMP" 2>/dev/null || true; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -1617,22 +1617,188 @@ echo "  ssh root@IP_СЕРВЕРА 'curl -fsSL https://raw.githubusercontent.com
 echo "Файл report.txt появится у вас на компьютере целиком, без обрезаний."
 echo "===================================================="
 
+# ---------- Public paste preparation (local only, before consent) ----------
+paste_prepare() {
+  local file="$1" cap="$2" compact="$3"
+  local size
+  size=$(wc -c < "$file")
+  [ "$size" -le "$cap" ] && return 0
+  [ "$compact" = 1 ] || return 2
+  # Keep every section title and prioritize evidence, not just the first N
+  # bytes of a large report. LC_ALL=C makes the cap count bytes, not characters.
+  # No partial UTF-8 lines: only select complete lines that fit their quota.
+  LC_ALL=C awk -v cap="$cap" -v size="$size" -v target="${AUDIT_DOMAIN:-}" '
+    function failure_group(x) {
+      x=tolower(x)
+      if(x ~ /upstream timed out|connection timed out/)return "upstream timeout"
+      if(x ~ /connection refused|no matching listener|no unix socket|no local listener/)return "missing upstream"
+      if(x ~ /table.*crash|table.*corrupt|wp_options.*crash/)return "database corruption"
+      if(x ~ /oom-kill|killed process|out of memory/)return "OOM"
+      if(x ~ /max_children|maximum number of processes/)return "PHP capacity"
+      if(x ~ /systemctl disable|systemctl stop|disabled|inactive \(dead\)/)return "autostart/stopped"
+      if(x ~ /filesystem >=|inode usage|no space/)return "storage pressure"
+      if(x ~ /http 5[0-9][0-9]|server error/)return "HTTP 5xx"
+      if(x ~ /tls failure|ssl handshake|certificate.*(failed|error)/)return "TLS"
+      if(x ~ /dns failure|connect failure|http 000/)return "transport"
+      if(x ~ /fatal error|segfault|crash/)return "application failure"
+      if(x ~ /error|failed|denied/)return "other error"
+      return ""
+    }
+    function priority(t, x) {
+      x=tolower(t)
+      if(target!="" && index(x,tolower(target)))return 7
+      if(failure_group(x)!="" && failure_group(x)!="other error")return 6
+      if(x ~ /oom-kill|killed process|out of memory|connection refused|upstream timed out|no matching listener|no unix socket|no local listener|server error|connect failure|tls failure|dns failure|timeout|timed out|fatal error|crash|corrupt|no space|inode usage|filesystem >=|max_children|http 5[0-9][0-9]|http 000|failed|disabled|inactive \(dead\)|status=exited|systemctl disable|systemctl stop|error:|denied/)return 5
+      if(x ~ /site summary|site .*not checked|^front |^backend |^public |^site |^vhost |oom kills|peak sampled|status [45][0-9][0-9]|endpoint .*xmlrpc|endpoint .*wordpress|ip [0-9]+|active:|autostart|is-enabled|service lifecycle|boot=-1|boot=0|sysv startup|^mem:|^swap:|^\/(dev|www|var)\/|load average/)return 4
+      if(x ~ /listen|port|server_name|proxy_pass|fastcgi_pass|pm.max_children|memory_limit|server version|installed|uptime|^total|^status |^ua_class|^endpoint|^\[!\]/)return 3
+      if(t ~ /^--- / || t ~ /^\[SECRET MODE\]/)return 2
+      return 1
+    }
+    function section_weight(h) {
+      if(h ~ /WEB STACK|WEB \/ PHP \/ DB ERROR|BOOT HISTORY|SERVICES \/ AUTOSTART|CHANGE EVIDENCE/)return 4
+      if(h ~ /TRAFFIC|STORAGE|PHP POOLS|DISK|CPU \/ MEMORY|DATABASES|DOMAINS/)return 3
+      return 1
+    }
+    BEGIN {
+      section=0; title[0]="## REPORT HEADER"; n[0]=0
+    }
+    /^## / && length($0)<160 && section<63 {
+      section++; title[section]=$0; n[section]=0; next
+    }
+    /^[[:space:]]*$/ || /^={8,}$/ { next }
+    {
+      t=$0
+      # Config directives can contain dozens of aliases on one giant line.
+      # Retain a concise primary name in the compact report instead.
+      if(t ~ /^[^ ]+:[0-9]+ server_name /){
+        split(t,a,/[[:space:]]+/); name=a[3];sub(/;$/,"",name)
+        if(name ~ /^[[:alnum:]][[:alnum:].-]*\.[[:alnum:].-]+$/ && name !~ /^[0-9.]+$/)
+          t="VHOST " name
+      }
+      i=++n[section]
+      line[section,i]=t
+      rank[section,i]=priority(t)
+      if(i<=3 && rank[section,i]<3)rank[section,i]=3
+    }
+    END {
+      intro="[COMPACT TERMBIN REPORT] Original displayed report: " size " bytes. Selected evidence from every section; omissions are marked. Full report is in the terminal."
+      header_bytes=length(intro)+1
+      total_weight=0
+      for(s=0;s<=section;s++){
+        weight[s]=section_weight(title[s]);total_weight+=weight[s]
+        header_bytes+=length(title[s])+2+100
+      }
+      available=cap-header_bytes
+      if(available<0)exit 2
+      print intro
+      for(s=0;s<=section;s++){
+        print ""; print title[s]
+        quota=int(available*weight[s]/total_weight)
+        used=0; selected=0
+        # First represent distinct severe failure classes (latest evidence
+        # where possible), then reserve space for site/status context.
+        for(p=7;p>=5;p--){
+          for(i=n[s];i>=1;i--){
+            group=failure_group(line[s,i])
+            if(rank[s,i]!=p || group=="" || seen[s,group])continue
+            bytes=length(line[s,i])+1
+            if(used+bytes<=int(quota*0.55)){
+              keep[s,i]=1;used+=bytes;selected++;seen[s,group]=1
+            }
+          }
+        }
+        # Primary vhost names and the inventory summary are more useful
+        # than long repetitive listener/config lines.
+        for(i=1;i<=n[s];i++){
+          if(keep[s,i] || line[s,i] !~ /^(VHOST |SITE SUMMARY:)/)continue
+          bytes=length(line[s,i])+1
+          if(used+bytes<=int(quota*0.78)){keep[s,i]=1;used+=bytes;selected++}
+        }
+        for(p=4;p>=2;p--){
+          for(i=1;i<=n[s];i++){
+            if(rank[s,i]!=p || keep[s,i])continue
+            bytes=length(line[s,i])+1
+            if(used+bytes<=int(quota*0.8)){keep[s,i]=1;used+=bytes;selected++}
+          }
+        }
+        for(p=7;p>=1;p--){
+          for(i=1;i<=n[s];i++){
+            if(rank[s,i]!=p || keep[s,i])continue
+            bytes=length(line[s,i])+1
+            if(used+bytes<=quota){keep[s,i]=1;used+=bytes;selected++}
+          }
+        }
+        for(i=1;i<=n[s];i++)if(keep[s,i])print line[s,i]
+        if(selected<n[s])printf "[COMPACT] %d detail lines omitted from this section.\n",n[s]-selected
+      }
+    }' "$file" > "$AUDIT_TMP/paste-compact" || return 1
+  size=$(wc -c < "$AUDIT_TMP/paste-compact")
+  [ "$size" -le "$cap" ] || return 1
+  mv -- "$AUDIT_TMP/paste-compact" "$file"
+  return 3
+}
+paste_upload() {
+  local payload="$1" response="$AUDIT_TMP/paste-response" errors="$AUDIT_TMP/paste-nc-error"
+  local help rc
+  local args=()
+  # OpenBSD netcat on Ubuntu/Debian supports -N: half-close the socket
+  # after stdin EOF so Fiche does not wait for its receive timeout.
+  help=$(timeout 2s nc -h 2>&1 || true)
+  if grep -Eq '(^|[[:space:],])-N([[:space:],]|$)' <<< "$help"; then args+=(-N); fi
+  if grep -Eq '(^|[[:space:],])-w([[:space:],]|$)' <<< "$help"; then args+=(-w 15); fi
+  timeout -k 2s 25s nc "${args[@]}" termbin.com 9999 < "$payload" 2>"$errors" | head -c 2048 > "$response"
+  rc=${PIPESTATUS[0]}
+  PASTE_NC_RC="$rc"
+  PASTE_RESPONSE_BYTES=$(wc -c < "$response")
+  # A Fiche response can end in CR/LF and NUL. Accept only a single trusted
+  # host/slug, then canonicalize to HTTPS. Never retry an ambiguous upload.
+  PASTE_URL=$(tr -d '\000\r' < "$response")
+  if [[ "$PASTE_URL" =~ ^https?://termbin\.com/([A-Za-z0-9_-]{1,80})[[:blank:]]*$ ]]; then
+    PASTE_URL="https://termbin.com/${BASH_REMATCH[1]}"
+    return 0
+  fi
+  PASTE_URL=""
+  return 1
+}
 # Optional legacy public paste. No upload without explicit opt-in; never
 # upload with SKIP_NET=1. Deletion is best-effort, not a privacy guarantee.
 DO_PASTE=0
+PASTE_READY=0
+PASTE_PAYLOAD="$AUDIT_TMP/paste-payload"
 if [ "${SKIP_NET:-0}" != 1 ]; then
   case "${PASTE:-}" in
-    1|y|Y|yes|YES) DO_PASTE=1 ;;
     0|n|N|no|NO) ;;
     *)
-      if [ -t 1 ] && ( : </dev/tty ) 2>/dev/null; then
-        echo "[!] Опубликовать отчёт на termbin.com? Ссылка публичная, без пароля."
-        echo "Запланировано удаление и проверка доступности ссылки. Гарантии конфиденциальности нет."
-        echo "Отчёт может содержать IP, домены, логи и нераспознанные секреты."
-        printf 'y/N: '
-        answer=""
-        read -r answer </dev/tty || true
-        case "$answer" in y|Y|yes|YES) DO_PASTE=1 ;; esac
+      if [[ "${PASTE:-}" =~ ^(1|y|Y|yes|YES)$ ]] || { [ -t 1 ] && ( : </dev/tty ) 2>/dev/null; }; then
+        # Fiche upstream defaults to 32KiB; the live public service limit
+        # is undocumented. Use a conservative default, with explicit override.
+        paste_cap="${PASTE_MAX_BYTES:-30000}"
+        if [[ ! "$paste_cap" =~ ^[0-9]{4,7}$ ]] || ((10#$paste_cap<4096 || 10#$paste_cap>1048576)); then paste_cap=30000; fi
+        paste_cap=$((10#$paste_cap))
+        head -n "$AUDIT_REPORT_LINES" "$FINAL" > "$PASTE_PAYLOAD"
+        paste_original_bytes=$(wc -c < "$PASTE_PAYLOAD")
+        compact=1
+        [ "${PASTE_MODE:-compact}" = full ] && compact=0
+        paste_prepare "$PASTE_PAYLOAD" "$paste_cap" "$compact"; prep_rc=$?
+        case "$prep_rc" in
+          0) PASTE_READY=1; echo "[*] Termbin: полный отчёт ($paste_original_bytes байт)." ;;
+          3) PASTE_READY=1; echo "[!] Termbin: полный отчёт $paste_original_bytes байт превышает лимит $paste_cap. Будет опубликована КОМПАКТНАЯ версия ($(wc -c < "$PASTE_PAYLOAD") байт); полный отчёт выше." ;;
+          2) echo "[!] Termbin: отчёт $paste_original_bytes байт больше PASTE_MAX_BYTES=$paste_cap; PASTE_MODE=full, публикация отменена." ;;
+          *) echo "[!] Не удалось подготовить компактную версию в лимите; публикация отменена." ;;
+        esac
+        if [ "$PASTE_READY" = 1 ]; then
+          case "${PASTE:-}" in
+            1|y|Y|yes|YES) DO_PASTE=1 ;;
+            *)
+              echo "[!] Опубликовать отчёт на termbin.com? Ссылка публичная, без пароля."
+              echo "Запланировано удаление и проверка доступности ссылки. Гарантии конфиденциальности нет."
+              echo "Отчёт может содержать IP, домены, логи и нераспознанные секреты."
+              printf 'y/N: '
+              answer=""
+              read -r answer </dev/tty || true
+              case "$answer" in y|Y|yes|YES) DO_PASTE=1 ;; esac ;;
+          esac
+        fi
       fi ;;
   esac
 fi
@@ -1645,10 +1811,9 @@ if [ "$DO_PASTE" = 1 ]; then
   elif [ "$ttl" != 0 ] && { ! has curl || { ! has setsid && ! has nohup; }; }; then
     echo "[!] Для проверяемого удаления нужны curl и setsid/nohup. Публикация отменена."
   else
-    # Use the exact capped, redacted report shown above; no raw upload.
-    PASTE_URL=$(head -n "$AUDIT_REPORT_LINES" "$FINAL" | timeout -k 2s 15s nc termbin.com 9999 2>/dev/null | tr -d '\000\r\n' | head -c 200)
-    if [[ "$PASTE_URL" =~ ^https://termbin\.com/([A-Za-z0-9_-]{1,80})$ ]]; then
-      slug="${BASH_REMATCH[1]}"
+    # Only upload the size-checked and redacted payload once.
+    if paste_upload "$PASTE_PAYLOAD"; then
+      slug="${PASTE_URL##*/}"
       echo "Ссылка: $PASTE_URL"
       echo "[!] Ссылка публичная; данные уже переданы стороннему сервису."
       echo "Ручное удаление (с того же IP):"
@@ -1702,7 +1867,16 @@ DELETE_WORKER
         else echo "[!] Не удалось получить результат проверки. Удаление не подтверждено."; fi
       fi
     else
-      echo "[!] Нет корректной ссылки от Termbin. Публикация могла состояться; удалить неизвестный URL нельзя. Используйте локальный отчёт."
+      echo "[!] Нет корректной ссылки от Termbin (nc exit=$PASTE_NC_RC, отправляемый размер=$(wc -c < "$PASTE_PAYLOAD") байт, ответ=$PASTE_RESPONSE_BYTES байт)."
+      case "$PASTE_NC_RC" in
+        124|137) echo "[!] Истёк таймаут соединения/ответа Termbin." ;;
+        *) if [ -s "$AUDIT_TMP/paste-nc-error" ]; then
+          echo "[!] Диагностика netcat:"
+          LC_ALL=C tr -cd '[:print:]\n' < "$AUDIT_TMP/paste-nc-error" | head -c 300
+          echo
+        fi ;;
+      esac
+      echo "[!] Публикация могла состояться; удалить неизвестный URL нельзя. Повтор автоматически не выполняется. Используйте локальный отчёт."
     fi
   fi
 fi

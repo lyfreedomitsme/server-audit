@@ -11,7 +11,7 @@ import tempfile
 import time
 
 source = Path(__file__).resolve().parents[1] / "server_audit.sh"
-footer = source.read_text().split("# Optional legacy public paste.", 1)[1]
+footer = source.read_text().split("# ---------- Public paste preparation", 1)[1]
 definitions = source.read_text().split("audit_number() {", 1)[1].split("\nAUDIT_TIMEOUT=", 1)[0]
 
 with tempfile.TemporaryDirectory() as tmp:
@@ -22,11 +22,17 @@ with tempfile.TemporaryDirectory() as tmp:
     script.write_text(
         'set -uo pipefail\nhas() { command -v "$1" >/dev/null 2>&1; }\n'
         + "audit_number() {" + definitions
-        + '\nFINAL="$TEST_REPORT"\nAUDIT_REPORT_LINES=1\nAUDIT_TMP="$TEST_DIR"\n# Optional legacy public paste.'
+        + '\nFINAL="$TEST_REPORT"\nAUDIT_REPORT_LINES=1\nAUDIT_TMP="$TEST_DIR"\n# ---------- Public paste preparation'
         + footer
     )
     nc = root / "nc"
-    nc.write_text('#!/bin/bash\ncat > "$TEST_UPLOAD"\nprintf "%s\\n" "${TEST_URL:-https://termbin.com/test123}"\n')
+    nc.write_text('''#!/bin/bash
+if [ "$1" = "-h" ]; then printf '%s\\n' ' -N shutdown after EOF' ' -w timeout'; exit 1; fi
+printf '%s\\n' "$*" > "$TEST_NC_ARGS"
+cat > "$TEST_UPLOAD"
+if [ "${TEST_NO_REPLY:-0}" = 1 ]; then echo "fixture connection timeout" >&2; exit 124; fi
+printf '%s\\r\\n\\000' "${TEST_URL:-https://termbin.com/test123}"
+''')
     nc.chmod(0o700)
     curl = root / "curl"
     curl.write_text("""#!/usr/bin/env python3
@@ -55,14 +61,15 @@ sys.exit(28 if code=='000' else 0)
     upload = root / "uploaded"
     events = root / "events"
     status = root / "paste-delete-status"
+    nc_args = root / "nc-args"
     base = dict(os.environ)
     for key in ("PASTE", "PASTE_TTL", "SKIP_NET"):
         base.pop(key, None)
     base.update(PATH=str(root)+":"+base["PATH"],TEST_REPORT=str(report),TEST_DIR=str(root),
-                TEST_UPLOAD=str(upload),TEST_EVENTS=str(events),PASTE_TTL="1")
+                TEST_UPLOAD=str(upload),TEST_EVENTS=str(events),TEST_NC_ARGS=str(nc_args),PASTE_TTL="1")
 
     def reset():
-        for p in (upload, events, status):
+        for p in (upload, events, status, nc_args):
             p.unlink(missing_ok=True)
     def event_list():
         return [json.loads(row) for row in events.read_text().splitlines()] if events.exists() else []
@@ -113,6 +120,7 @@ sys.exit(28 if code=='000' else 0)
     ev=event_list()
     assert link is not None and link-start<3, "link not immediate"
     assert upload.read_text()=="redacted test report\n", "wrong payload"
+    assert "-N -w 15 termbin.com 9999" in nc_args.read_text()
     assert [e["method"] for e in ev]==["POST","GET"], ev
     assert ev[0]["time"]-link>=14.5, ev
     assert ev[0]["time"]-link<19, ev
@@ -140,6 +148,31 @@ sys.exit(28 if code=='000' else 0)
     result,_,_=interactive("y",{"PASTE_TTL":"0"})
     assert upload.exists() and not events.exists() and "отключено" in result
     print("PASS: invalid response and explicit TTL disable",flush=True)
+    reset()
+    result,_,_=interactive("y",{"TEST_URL":"http://termbin.com/test123","PASTE_TTL":"1"})
+    assert "https://termbin.com/test123" in result and len(event_list())==2
+    reset()
+    result,_,_=interactive("y",{"TEST_NO_REPLY":"1"})
+    assert upload.exists() and not events.exists()
+    assert "nc exit=124" in result and "ответ=0 байт" in result
+    print("PASS: EOF flags, NUL/CRLF response, HTTP URL normalization, timeout evidence",flush=True)
+    reset()
+    # Big report must become a bounded, marked, still text-readable paste.
+    report.write_text("## INCIDENT — WEB STACK / VHOST ROUTING / UPSTREAM HEALTH\n"+ "detail "*2000+"\n"+"FRONT https://example.test/ => HTTP 502 [SERVER ERROR]\n"+"## INCIDENT — BOOT HISTORY / OOM / BEFORE AND AFTER REBOOT\n"+ "line filler "*2000+"\n"+"Out of memory: Killed process 123 (mariadbd)\n")
+    # The fixture normally caps one line; increase it for this scenario.
+    original_script=script.read_text()
+    script.write_text(original_script.replace("AUDIT_REPORT_LINES=1","AUDIT_REPORT_LINES=5000"))
+    result,_,_=interactive("y",{"PASTE_MAX_BYTES":"4096","PASTE_TTL":"1"})
+    payload=upload.read_text()
+    assert len(payload.encode())<=4096 and "[COMPACT TERMBIN REPORT]" in payload
+    assert "HTTP 502" in payload and "Out of memory" in payload
+    assert "КОМПАКТНАЯ" in result and len(event_list())==2
+    reset()
+    run=subprocess.run(["bash",str(script)],env=base|{"PASTE":"1","PASTE_MODE":"full","PASTE_MAX_BYTES":"4096"},capture_output=True,timeout=5)
+    assert not upload.exists() and "публикация отменена" in run.stdout.decode()
+    print("PASS: oversized report compact/marked; full-only mode refuses without upload",flush=True)
+    report.write_text("redacted test report\nsecond line\n")
+    script.write_text(original_script)
     reset()
     # Disconnect the waiting process after the detached worker is launched.
     proc=subprocess.Popen(["bash",str(script)],env=base|{"PASTE":"1","PASTE_TTL":"2"},
