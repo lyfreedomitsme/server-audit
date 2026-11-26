@@ -22,6 +22,19 @@ sections=[
     "ActiveEnterTimestamp=Thu 2026-11-26 09:11:33 UTC\nUnitFileState=generated\nis-enabled: enabled\n"
     "--- php-fpm.service ---\nActiveState=inactive\nSubState=dead\nResult=oom-kill\n"
     "NRestarts=4\nis-enabled: disabled\n"+filler,
+    "## INCIDENT — CONTROL PANEL / HTTP API / TLS\n"
+    "PANEL DETECTED FASTPANEL candidate_port=8888 (default/config hint)\n"
+    "PANEL FASTPANEL LOCAL https://127.0.0.1:8888/ => HTTP 200 [OK (HTTP response)]\n"
+    "PANEL FASTPANEL LOCAL https://127.0.0.1:8888/license/status => HTTP 000 [TIMEOUT]\n"
+    "--- PANEL LOG FASTPANEL /var/log/fastpanel2/updater.log ---\n"
+    "[ERROR] Number of update exceeded\n"+filler,
+    "## INCIDENT — PACKAGE MANAGER / INTERRUPTED UPDATES\n"
+    "PACKAGE INSTALLED iU mysql-server-8.0 8.0.45\n"
+    "PACKAGE CANDIDATE fastpanel2 installed=1.11 candidate=8.0\n"
+    "PACKAGE apt dependency check exit=100\n"
+    "Depends: mysql-server-core-8.0 (= 8.0.45) but 8.0.46 is installed\n"+filler,
+    "## INCIDENT — FIREWALL / SAVED VS LIVE\n"
+    "FIREWALL DRIFT IPv4 saved ACCEPT missing in live ufw-user-input: tcp 8888 src=any dst=any in=any\n"+filler,
     "## INCIDENT — WEB STACK / VHOST ROUTING / UPSTREAM HEALTH\n"
     "/etc/nginx/site.conf:1 server_name main.test city.main.test;\n"
     "SITE main.test\nSITE other.test\nSITE other.test => NOT CHECKED (site probe cap 1)\n"
@@ -71,6 +84,10 @@ with tempfile.TemporaryDirectory() as tmp:
     output=payload.read_text()
     assert len(output.encode())<=30000
     assert "[COMPACT TERMBIN REPORT]" in output
+    assert "/license/status => HTTP 000 [TIMEOUT]" in output
+    assert "PACKAGE INSTALLED iU mysql-server-8.0 8.0.45" in output
+    assert "PACKAGE apt dependency check exit=100" in output
+    assert "FIREWALL DRIFT IPv4 saved ACCEPT missing in live ufw-user-input: tcp 8888" in output
     assert "OOM_COUNT boot=-1 victim=mariadbd kills=41" in output
     assert "OOM_COUNT boot=0 no victim counts printed" in output
     assert re.search(r"^SERVICE httpd\.service .*active=active.*is-enabled=enabled",output,re.M)
