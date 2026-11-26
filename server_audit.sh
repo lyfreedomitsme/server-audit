@@ -958,9 +958,390 @@ audit_access_sample() {
       }'
 }
 
+# ---------- Control-plane diagnostics: local panel access, package state, firewall drift ----------
+# Registered default ports are hints, not proof of panel ownership. Explicit
+# ports and known on-disk config values are preferred; never eval/source configs.
+audit_panel_port_ok() {
+  [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+AUDIT_PANEL_PORT=${AUDIT_PANEL_PORT:-}
+AUDIT_PANEL_HOST=${AUDIT_PANEL_HOST:-}
+if [ -n "$AUDIT_PANEL_PORT" ] && ! audit_panel_port_ok "$AUDIT_PANEL_PORT"; then
+  echo "[!] AUDIT_PANEL_PORT must be a TCP port (1-65535)." >&2; exit 2
+fi
+if [ -n "$AUDIT_PANEL_HOST" ] && ! audit_domain_ok "$AUDIT_PANEL_HOST"; then
+  echo "[!] AUDIT_PANEL_HOST must be a hostname without scheme/path/port." >&2; exit 2
+fi
+[ -z "$AUDIT_PANEL_PORT" ] || AUDIT_PANEL_PORT=$((10#$AUDIT_PANEL_PORT))
+AUDIT_PANEL_HOST=${AUDIT_PANEL_HOST,,}
+
+audit_panel_config_port() {
+  local file="$1" value
+  [ -r "$file" ] && [ -f "$file" ] || return 1
+  value=$(awk '
+    /^[[:space:]]*#/ {next}
+    /^[[:space:]]*(port|BACKEND_PORT)[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, ""); gsub(/["\047[:space:]]/, ""); if(/^[0-9]+$/){print;exit}
+    }
+    /^[[:space:]]*[0-9]+[[:space:]]*$/ {gsub(/[[:space:]]/,"");print;exit}
+  ' "$file")
+  audit_panel_port_ok "$value" || return 1
+  printf '%s\n' "$((10#$value))"
+}
+
+audit_panel_registry() {
+  [ ! -d /usr/local/fastpanel2 ] || echo 'FASTPANEL|8888|https|fastpanel2-ngin'
+  [ ! -d /usr/local/hestia ] || echo "HestiaCP|$(audit_panel_config_port /usr/local/hestia/conf/hestia.conf || echo 8083)|https|hestia-nginx"
+  [ ! -d /usr/local/mgr5 ] || echo 'ISPmanager|1500|https|ihttpd'
+  [ ! -d /usr/local/directadmin ] || echo "DirectAdmin|$(audit_panel_config_port /usr/local/directadmin/conf/directadmin.conf || echo 2222)|https|directadmin"
+  [ ! -d /www/server/panel ] || echo "aaPanel|$(audit_panel_config_port /www/server/panel/data/port.pl || echo 8888)|https|BT-Panel|bt-panel"
+  [ ! -d /usr/local/vesta ] || echo 'VestaCP|8083|https|vesta-nginx'
+  [ ! -d /usr/local/psa ] || echo 'Plesk|8443|https|sw-cp-server'
+  if [ -d /usr/local/cpanel ]; then
+    echo 'cPanel|2083|https|cpsrvd'; echo 'WHM|2087|https|cpsrvd'
+  fi
+  [ ! -d /usr/local/CyberCP ] || echo 'CyberPanel|8090|https|lscpd'
+  if [ -d /home/clp ] || [ -d /etc/cloudpanel ] || has clpctl; then echo 'CloudPanel|8443|https|cloudpanel'; fi
+  [ ! -d /etc/webmin ] || echo "Webmin/Virtualmin|$(audit_panel_config_port /etc/webmin/miniserv.conf || echo 10000)|https|miniserv"
+  [ ! -d /home/keyhelp ] || echo 'KeyHelp|443|https|keyhelp'
+  return 0
+}
+
+audit_panel_listener_ports() {
+  # The registry regex is authored above, never read from configuration.
+  # Restrict auto-detection to identifiable panel processes and cap per panel.
+  local pattern="$1"
+  [ "$TCP_OK" = 1 ] || return 0
+  printf '%s\n' "$TCP_LISTEN" | awk -v p="$pattern" '
+    $0 ~ ("users:.*\\(\"(" p ")\"") {
+      a=$4; sub(/^.*:/,"",a); if(a~/^[0-9]+$/)print a
+    }' | sort -nu | head -n 4
+}
+
+audit_panel_http() {
+  local name="$1" scheme="$2" host="$3" port="$4" address="$5" path="$6" mode="$7"
+  local result rc code
+  local args=(curl -q --noproxy '*' -sS --connect-timeout 2 --max-time 6)
+  # Local diagnostic probe only: separate transport/API response from trust.
+  # Never send credentials, store bodies, follow redirects, or use an unknown URL.
+  if [ "$mode" = LOCAL ]; then
+    [ "$scheme" != https ] || args+=(-k)
+    args+=(--connect-to "$host:$port:$address:$port")
+  elif [ "$mode" = TLS_VERIFY ]; then
+    args+=(--connect-to "$host:$port:$address:$port")
+  fi
+  result=$(audit_cmd "${args[@]}" -o /dev/null -w 'HTTP %{http_code} connect=%{time_connect}s ttfb=%{time_starttransfer}s total=%{time_total}s bytes=%{size_download}' "$scheme://$host:$port$path" 2>&1); rc=$?
+  code=$(printf '%s\n' "$result" | sed -nE 's/.*HTTP ([0-9]{3}).*/\1/p' | tail -n1)
+  printf 'PANEL %s %s %s://%s:%s%s => %s [%s]\n' "$name" "$mode" "$scheme" "$host" "$port" "$path" "$(printf '%s' "$result" | tr '\r\n' ' ' | cut -c1-300)" "$(audit_http_classify "${code:-000}" "$rc")"
+  return "$rc"
+}
+
+audit_panel_hostnames() {
+  local name="$1" f
+  if [ -n "$AUDIT_PANEL_HOST" ]; then echo "$AUDIT_PANEL_HOST"; return; fi
+  # FASTPANEL keeps its panel vhosts separately from customer sites.
+  # For other panels an explicit AUDIT_PANEL_HOST avoids guessing site domains.
+  if [ "$name" = FASTPANEL ]; then
+    for f in /usr/local/fastpanel2-nginx/vhosts/*.conf; do
+      [ -f "$f" ] || continue
+      awk '$1=="server_name" {for(i=2;i<=NF;i++){n=$i;sub(/;.*/,"",n);print n}}' "$f"
+    done | while IFS= read -r f; do audit_domain_ok "$f" && printf '%s\n' "$f"; done | sort -u | head -n 2
+  fi
+  return 0
+}
+
+audit_panel_logs() {
+  local name="$1" f count=0
+  local -a files=()
+  case "$name" in
+    FASTPANEL) files=(/var/log/fastpanel2/fastpanel2.error.log /var/log/fastpanel2/fast.log /var/log/fastpanel2/updater.log /var/log/fastpanel2/fastpanel2.log);;
+    HestiaCP) files=(/usr/local/hestia/log/system.log /usr/local/hestia/log/error/system.log /usr/local/hestia/log/nginx-error.log);;
+    ISPmanager) files=(/usr/local/mgr5/var/ispmgr.log /usr/local/mgr5/var/ihttpd.log /var/log/ispmgr.log);;
+    DirectAdmin) files=(/var/log/directadmin/error.log /var/log/directadmin/errortaskq.log);;
+    aaPanel) files=(/www/server/panel/logs/error.log /www/server/panel/logs/panel.log);;
+    VestaCP) files=(/usr/local/vesta/log/system.log /usr/local/vesta/log/nginx-error.log);;
+    Plesk) files=(/var/log/plesk/panel.log /var/log/sw-cp-server/error_log);;
+    cPanel) files=(/usr/local/cpanel/logs/error_log /usr/local/cpanel/logs/license_log);;
+    CyberPanel) files=(/usr/local/lscp/logs/error.log /home/cyberpanel/error-logs.txt);;
+    CloudPanel) files=(/home/clp/logs/error.log /var/log/cloudpanel/error.log);;
+    Webmin/Virtualmin) files=(/var/webmin/miniserv.error /var/log/webmin/miniserv.error);;
+    KeyHelp) files=(/var/log/keyhelp/error.log);;
+  esac
+  for f in "${files[@]}"; do
+    [ -f "$f" ] && [ -r "$f" ] || continue
+    ((count+=1))
+    echo "--- PANEL LOG $name $f ($(stat -c 'mtime=%y bytes=%s' "$f" 2>/dev/null)) ---"
+    # No access logs, request bodies or routine commands. Query strings removed
+    # before global redaction. Log excerpts can be historical, not proof of now.
+    audit_cmd tail -n 400 "$f" | grep -iE 'error|warn|fatal|timeout|timed out|refused|failed|license|licence|upstream|candidate version|nothing to update|number of update exceeded|migration|database.*locked|disk.*full|no space' | tail -n "$AUDIT_LOG_LINES" | sed -E 's/\?[^[:space:]"\047]+/?[REDACTED]/g' | cut -c1-900
+  done
+  [ "$count" -ne 0 ] || echo "PANEL LOG $name: no known readable logs (not proof there are no errors)"
+}
+
+audit_panel_health() {
+  sep "INCIDENT — CONTROL PANEL / HTTP API / TLS"
+  local registry name port scheme proc owned address host p path rc probe_count=0 start=$SECONDS
+  local hosts
+  local TCP_LISTEN TCP_OK=0
+  TCP_LISTEN=$(audit_cmd ss -H -lntp 2>/dev/null) && TCP_OK=1
+  registry=$(audit_panel_registry)
+  if [ -n "$AUDIT_PANEL_PORT" ]; then registry+=$'\n'"Custom|$AUDIT_PANEL_PORT|https|"; fi
+  if [ -z "$registry" ]; then echo "No known panel detected; use AUDIT_PANEL_PORT for a custom panel."; return 0; fi
+  echo "Local probes only; a local 200 is not proof of external reachability or authentication. HTTP/TLS probe budget: about 60 seconds (checked between probes)."
+  echo "TLS verification by IP can fail normally if the certificate is issued for a DNS name; supply AUDIT_PANEL_HOST to check that hostname."
+  while IFS='|' read -r name port scheme proc; do
+    [ -n "$name" ] || continue
+    echo "PANEL DETECTED $name candidate_port=$port (default/config hint)"
+    owned=""
+    [ -z "$proc" ] || owned=$(audit_panel_listener_ports "$proc")
+    for p in $(printf '%s\n%s\n' "$port" "$owned" | sort -nu); do
+      audit_panel_port_ok "$p" || continue
+      echo "PANEL LISTENER $name port=$p: $(printf '%s\n' "$TCP_LISTEN" | awk -v p="$p" '$4~(":"p"$"){print;f=1} END{if(!f)print "not present or unavailable"}' | head -n 2 | cut -c1-350 | tr '\n' ' ')"
+      address=$(audit_front_address "$p") || continue
+      if [ "$address" = 127.0.0.1 ] && ! printf '%s\n' "$TCP_LISTEN" | awk -v p="$p" '$4==("127.0.0.1:"p)||$4==("0.0.0.0:"p)||$4==("*:"p){f=1}END{exit !f}'; then
+        if printf '%s\n' "$TCP_LISTEN" | awk -v p="$p" '$4==("[::]:"p)||$4==("[::1]:"p){f=1}END{exit !f}'; then address='[::1]'; fi
+      fi
+      [ "${SKIP_HTTP:-0}" != 1 ] && has curl || continue
+      ((probe_count+=1)); if [ "$probe_count" -gt 16 ] || (( SECONDS-start >= 60 )); then echo "PANEL probe cap/budget reached"; break; fi
+      audit_panel_http "$name" "$scheme" "$address" "$p" "$address" / LOCAL; rc=$?
+      # Some panels are configured as plain HTTP. No credentials or body.
+      if [ "$rc" = 35 ] && (( SECONDS-start < 60 )); then audit_panel_http "$name" http "$address" "$p" "$address" / LOCAL || true; fi
+      if [ "$name" = FASTPANEL ] && { [ "$p" = "$port" ] || [ "$p" = "$AUDIT_PANEL_PORT" ]; }; then
+        for path in /resource/public/settings /resource/menu_logo /license/status; do
+          (( SECONDS-start < 60 )) || { echo "PANEL API probe budget reached"; break; }
+          audit_panel_http "$name" https "$address" "$p" "$address" "$path" LOCAL || true
+        done
+      fi
+      hosts=$(audit_panel_hostnames "$name")
+      [ -n "$hosts" ] || hosts="$address"
+      while IFS= read -r host; do
+        [ -n "$host" ] || continue
+        (( SECONDS-start < 60 )) || { echo "PANEL TLS probe budget reached"; break; }
+        if audit_domain_ok "$host" && [ "${SKIP_NET:-0}" != 1 ] && has getent; then
+          local dns
+          dns=$(audit_cmd getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u | head -n 6 | paste -sd, -)
+          echo "PANEL DNS $host: ${dns:-NO DNS ANSWER (resolver error or missing record)}"
+        fi
+        audit_panel_http "$name" https "$host" "$p" "$address" / TLS_VERIFY || true
+        if has openssl && has timeout; then
+          echo "PANEL CERTIFICATE $name $host:$p (served certificate metadata)"
+          local -a sni=(); if audit_domain_ok "$host"; then sni=(-servername "$host"); fi
+          timeout -k 1s 5s openssl s_client -connect "$address:$p" "${sni[@]}" </dev/null 2>/dev/null | openssl x509 -noout -subject -issuer -dates -ext subjectAltName 2>/dev/null | head -n 8
+        fi
+      done <<< "$hosts"
+    done
+    if [ "$name" = FASTPANEL ] && [ "${SKIP_HTTP:-0}" != 1 ] && has curl && (( SECONDS-start < 60 )); then
+      # A root request to the API process can legitimately be 404. Test an actual
+      # public endpoint instead, to isolate reverse-proxy vs backend failures.
+      if [[ "$(audit_local_port_status 127.0.0.1 5501)" == LISTENER* ]]; then
+        audit_panel_http "$name-backend" http 127.0.0.1 5501 127.0.0.1 /resource/public/settings LOCAL || true
+      fi
+    fi
+    audit_panel_logs "$name"
+  done <<< "$registry"
+  echo "HTTP 404 on a panel/API route can be normal after an upgrade or on a secret login path."
+}
+
+audit_package_health() {
+  sep "INCIDENT — PACKAGE MANAGER / INTERRUPTED UPDATES"
+  local result rc installed
+  if has dpkg; then
+    result=$(audit_cmd dpkg --audit 2>&1); rc=$?
+    if [ "$rc" = 0 ] && [ -z "$result" ]; then echo "PACKAGE dpkg audit: clean"
+    else echo "PACKAGE dpkg audit (exit=$rc):"; printf '%s\n' "$result" | head -n 40; fi
+    echo "--- installed panel and related package versions/status ---"
+    installed=$(audit_cmd dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' 2>/dev/null | grep -Ei ' (fastpanel2[^ ]*|hestia[^ ]*|vesta[^ ]*|ispmanager[^ ]*|isp-system[^ ]*|directadmin[^ ]*|plesk[^ ]*|psa[^ ]*|sw-cp-server[^ ]*|webmin[^ ]*|cloudpanel[^ ]*|mysql-(server|client)[^ ]*|mariadb-(server|client)[^ ]*) ' | head -n 60)
+    printf '%s\n' "$installed" | sed '/^$/d;s/^/PACKAGE INSTALLED /'
+    if has apt-get; then
+      # Simulation only. No refresh, install/upgrade, lock deletion or repair.
+      result=$(audit_cmd apt-get -s -o Debug::NoLocking=1 check 2>&1); rc=$?
+      echo "PACKAGE apt dependency check exit=$rc"; printf '%s\n' "$result" | head -n 35
+      if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ]; then
+        echo "--- repair simulation only (no package removals permitted) ---"
+        audit_cmd apt-get -s -o Debug::NoLocking=1 --no-remove --fix-broken install 2>&1 | head -n 40
+      fi
+    fi
+    if has apt-cache; then
+      echo "--- package candidates (existing local cache; no apt update) ---"
+      local -a packages=()
+      mapfile -t packages < <(printf '%s\n' "$installed" | awk '$2~/^[a-z0-9][a-z0-9+.:_-]*$/{print $2}' | head -n 25)
+      if ((${#packages[@]})); then
+        audit_cmd apt-cache policy "${packages[@]}" 2>/dev/null | awk '
+          /^[^[:space:]].*:$/ {p=$0;sub(/:$/,"",p)}
+          /^[[:space:]]+Installed:/ {installed=$2}
+          /^[[:space:]]+Candidate:/ {print "PACKAGE CANDIDATE",p,"installed=" installed,"candidate=" $2}
+        '
+      fi
+    fi
+    if has apt-mark; then audit_exec apt-mark showhold; fi
+  elif has rpm; then
+    echo "--- installed RPM panel/package versions ---"
+    audit_cmd rpm -qa 2>/dev/null | grep -Ei '^(fastpanel2|hestia|vesta|ispmanager|directadmin|plesk|psa|sw-cp-server|webmin|cloudpanel|mysql-(server|client)|mariadb-(server|client))' | head -n 60
+    if has dnf; then audit_cmd dnf -C check --dependencies 2>&1 | head -n 60
+    elif has yum; then audit_cmd yum -C check dependencies 2>&1 | head -n 60; fi
+  else echo "PACKAGE dependency audit unavailable for this package manager"; fi
+  if has lslocks; then
+    echo "--- visible package-manager locks (no lock file deletion) ---"
+    audit_cmd lslocks -n -o COMMAND,PID,PATH 2>/dev/null | grep -E '/(apt|dpkg|rpm|dnf|yum)/|/var/lib/dpkg/lock|/var/lib/rpm/\.rpm.lock' | head -n 12
+  fi
+}
+
+audit_fw_allow_signatures() {
+  # Compare only straightforward TCP/UDP ACCEPT rules, normalizing optional
+  # protocol match modules and implicit any-addresses. Unknown/complex rules
+  # are omitted rather than falsely declaring a mismatch or blocked port.
+  awk -v chain="$1" '
+    $1=="-A" && $2==chain {
+      proto=port=target=iface=""; src=dst="any"; ok=1
+      for(i=3;i<=NF;i++){
+        k=$i
+        if(k=="-p"){proto=$(++i)}
+        else if(k=="--dport"){port=$(++i)}
+        else if(k=="-j"){target=$(++i)}
+        else if(k=="-s"){src=$(++i)}
+        else if(k=="-d"){dst=$(++i)}
+        else if(k=="-i"){iface=$(++i)}
+        else if(k=="-m"){m=$(++i);if(m!="tcp"&&m!="udp")ok=0}
+        else ok=0
+      }
+      if(src=="0.0.0.0/0"||src=="::/0")src="any"
+      if(dst=="0.0.0.0/0"||dst=="::/0")dst="any"
+      if(ok && target=="ACCEPT" && proto~/^(tcp|udp)$/ && port~/^[0-9]+(:[0-9]+)?$/)
+        print proto,port,"src=" src,"dst=" dst,"in=" (iface==""?"any":iface)
+    }' | sort -u
+}
+audit_fw_compare() {
+  local family="$1" chain="$2" saved="$3" live="$4" expected actual missing extra
+  expected=$(printf '%s\n' "$saved" | audit_fw_allow_signatures "$chain")
+  actual=$(printf '%s\n' "$live" | audit_fw_allow_signatures "$chain")
+  missing=$(comm -23 <(printf '%s\n' "$expected" | sed '/^$/d') <(printf '%s\n' "$actual" | sed '/^$/d'))
+  extra=$(comm -13 <(printf '%s\n' "$expected" | sed '/^$/d') <(printf '%s\n' "$actual" | sed '/^$/d'))
+  if [ -z "$expected" ] && [ -z "$actual" ]; then
+    echo "FIREWALL $family no comparable simple ACCEPT rules in $chain"
+    return 0
+  fi
+  if [ -n "$missing" ]; then
+    while IFS= read -r rule; do echo "FIREWALL DRIFT $family saved ACCEPT missing in live $chain: $rule"; done <<< "$missing"
+  else echo "FIREWALL $family: no missing simple saved ACCEPT signatures in $chain"; fi
+  if [ -n "$extra" ]; then
+    while IFS= read -r rule; do echo "FIREWALL DRIFT $family live ACCEPT not in saved $chain: $rule"; done <<< "$extra"
+  fi
+  echo "FIREWALL note: signature mismatch is evidence of drift, not a full packet verdict; other chains/backends may allow or drop traffic."
+}
+audit_firewall_port_rules() {
+  # Match exact port tokens in dport/dports expressions and retain chain names.
+  # Ranges, sets, interfaces and rule order can require a manual packet trace.
+  local ports="$1"
+  awk -v ports="$ports" '
+    BEGIN {n=split(ports,a,/[^0-9]+/); for(i=1;i<=n;i++)if(a[i]!="")wanted[a[i]]=1}
+    /^[[:space:]]*table /{table=$0}
+    /^[[:space:]]*chain /{chain=$0}
+    {
+      for(i=1;i<NF;i++)if($i=="--dport"||$i=="--dports"||$i=="dport"){
+        value=$(i+1)
+        if(value=="{"){value="";j=i+2;while(j<=NF&&$j!="}")value=value " " $(j++)}
+        m=split(value,b,/[^0-9]+/)
+        for(j=1;j<=m;j++)if(b[j] in wanted){
+          if($1=="-A")print "FIREWALL port=" b[j],$0
+          else print "FIREWALL port=" b[j],table,chain,$0
+          break
+        }
+      }
+    }'
+}
+audit_firewalld_compare() {
+  local zone="$1" type="$2" runtime="$3" permanent="$4" missing extra
+  local rt perm
+  rt=$(printf '%s\n' "$runtime" | tr '[:space:]' '\n' | sed '/^$/d' | sort -u)
+  perm=$(printf '%s\n' "$permanent" | tr '[:space:]' '\n' | sed '/^$/d' | sort -u)
+  missing=$(comm -23 <(printf '%s\n' "$perm" | sed '/^$/d') <(printf '%s\n' "$rt" | sed '/^$/d'))
+  extra=$(comm -13 <(printf '%s\n' "$perm" | sed '/^$/d') <(printf '%s\n' "$rt" | sed '/^$/d'))
+  if [ -n "$missing" ]; then echo "FIREWALL DRIFT firewalld zone=$zone permanent $type missing in runtime: $(echo "$missing" | paste -sd, -)"; fi
+  if [ -n "$extra" ]; then echo "FIREWALL DRIFT firewalld zone=$zone runtime-only $type: $(echo "$extra" | paste -sd, -)"; fi
+}
+audit_firewall_health() {
+  sep "INCIDENT — FIREWALL / SAVED VS LIVE"
+  local family bin chain file stored live rc zone active mode ports registry name port scheme proc type runtime permanent rt_rc perm_rc
+  local TCP_LISTEN TCP_OK=0
+  TCP_LISTEN=$(audit_cmd ss -H -lntp 2>/dev/null) && TCP_OK=1
+  registry=$(audit_panel_registry)
+  ports="$AUDIT_PANEL_PORT"
+  while IFS='|' read -r name port scheme proc; do
+    [ -n "$name" ] || continue
+    ports+=" $port"
+    [ -z "$proc" ] || ports+=" $(audit_panel_listener_ports "$proc")"
+  done <<< "$registry"
+  if has ufw; then
+    active=$(audit_cmd ufw status 2>&1)
+    printf '%s\n' "$active" | head -n 25
+    if [[ "$active" == "Status: active"* ]]; then
+      for family in IPv4 IPv6; do
+        if [ "$family" = IPv4 ]; then bin=iptables; chain=ufw-user-input; file=/etc/ufw/user.rules
+        else bin=ip6tables; chain=ufw6-user-input; file=/etc/ufw/user6.rules; fi
+        if ! has "$bin" || [ ! -r "$file" ]; then echo "FIREWALL $family saved/live comparison unavailable"; continue; fi
+        live=$(audit_cmd "$bin" -S "$chain" 2>&1); rc=$?
+        if [ "$rc" -ne 0 ]; then echo "FIREWALL $family live $chain unavailable (exit=$rc)"; continue; fi
+        stored=$(audit_cmd cat "$file" 2>/dev/null); rc=$?
+        [ "$rc" = 0 ] || { echo "FIREWALL $family saved rules unavailable"; continue; }
+        echo "FIREWALL $family saved source=$file $(stat -c 'mtime=%y' "$file" 2>/dev/null)"
+        audit_fw_compare "$family" "$chain" "$stored" "$live" | head -n 60
+        echo "--- $family live user rules (bounded) ---"; printf '%s\n' "$live" | head -n 30
+      done
+    else echo "FIREWALL UFW inactive or status unavailable; no saved/live comparison"; fi
+  fi
+  for bin in iptables ip6tables; do
+    has "$bin" || continue
+    audit_exec "$bin" --version
+    echo "--- $bin live INPUT policy/jumps (bounded) ---"; audit_cmd "$bin" -S INPUT 2>&1 | head -n 35
+    if has "$bin-save" && [ -n "${ports//[[:space:]]/}" ]; then
+      echo "--- $bin panel-port rules across filter chains (bounded; exact tokens only) ---"
+      audit_cmd "$bin-save" -t filter 2>/dev/null | audit_firewall_port_rules "$ports" | head -n 35 | cut -c1-600
+    fi
+  done
+  echo "--- persistent firewall source metadata (not proof of load order) ---"
+  for file in /etc/ufw/user.rules /etc/ufw/user6.rules /etc/iptables/rules.v4 /etc/iptables/rules.v6 /etc/nftables.conf; do
+    [ -f "$file" ] || continue
+    stat -c '%n mtime=%y bytes=%s' "$file" 2>/dev/null
+  done
+  if audit_systemd; then
+    for mode in ufw netfilter-persistent nftables firewalld; do
+      echo "FIREWALL service $mode enabled=$(audit_cmd systemctl is-enabled "$mode" 2>/dev/null || true) active=$(audit_cmd systemctl is-active "$mode" 2>/dev/null || true)"
+    done
+  fi
+  if has iptables && audit_cmd iptables -S fastpanel_rules >/dev/null 2>&1; then
+    echo "--- active FASTPANEL chain (bounded) ---"; audit_cmd iptables -nvL fastpanel_rules --line-numbers 2>&1 | head -n 45
+  fi
+  if has firewall-cmd && [ "$(audit_cmd firewall-cmd --state 2>/dev/null)" = running ]; then
+    echo "--- firewalld active zones and runtime/permanent port/service lists ---"
+    active=$(audit_cmd firewall-cmd --get-active-zones 2>/dev/null)
+    printf '%s\n' "$active" | head -n 24
+    while IFS= read -r zone; do
+      [[ "$zone" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+      for type in ports services; do
+        runtime=$(audit_cmd firewall-cmd --zone="$zone" --list-"$type" 2>&1); rt_rc=$?
+        permanent=$(audit_cmd firewall-cmd --permanent --zone="$zone" --list-"$type" 2>&1); perm_rc=$?
+        printf 'FIREWALL firewalld zone=%s runtime %s=%s (exit=%s)\n' "$zone" "$type" "$runtime" "$rt_rc"
+        printf 'FIREWALL firewalld zone=%s permanent %s=%s (exit=%s)\n' "$zone" "$type" "$permanent" "$perm_rc"
+        if [ "$rt_rc" = 0 ] && [ "$perm_rc" = 0 ]; then
+          audit_firewalld_compare "$zone" "$type" "$runtime" "$permanent"
+        fi
+      done
+    done < <(printf '%s\n' "$active" | awk '/^[^[:space:]]/{print $1}' | head -n 5)
+  fi
+  if has nft; then
+    echo "--- nftables input hook policies (not a complete evaluation) ---"
+    audit_cmd nft list ruleset 2>/dev/null | awk '/^[[:space:]]*table /{t=$0} /^[[:space:]]*chain /{c=$0} /hook input/{print t,c,$0}' | head -n 20
+    if [ -n "${ports//[[:space:]]/}" ]; then
+      echo "--- nftables panel-port rules (bounded; exact tokens only) ---"
+      audit_cmd nft list ruleset 2>/dev/null | audit_firewall_port_rules "$ports" | head -n 35 | cut -c1-600
+    fi
+  fi
+}
+
+
 main_audit() {
 audit_detect
-echo "SERVER AUDIT REPORT v3.2.3"
+echo "SERVER AUDIT REPORT v3.3.0"
 echo "History: last $AUDIT_HISTORY_DAYS days, current and previous retained boot; target: ${AUDIT_DOMAIN:-auto}"
 echo "Host: $(hostname)   Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 echo "===================================================="
@@ -1006,6 +1387,9 @@ echo "Подробности по каждому пункту — в соотв�
 # High-priority incident evidence first: it must survive report truncation.
 audit_boot_history
 audit_service_inventory
+audit_package_health
+audit_firewall_health
+audit_panel_health
 audit_web
 audit_logs
 audit_bot_traffic
@@ -1291,7 +1675,7 @@ fi
 if [ -d /usr/local/fastpanel2 ]; then
   echo "FastPanel найдена:"
   panel_status "fastpanel2" fastpanel2
-  panel_log "FastPanel log" /var/log/fastpanel2/fastpanel2.log /var/log/fastpanel2.log
+  echo "Panel error/backend/updater logs: see INCIDENT — CONTROL PANEL / HTTP API / TLS."
   echo
 fi
 if [ -d /usr/local/directadmin ]; then
@@ -1646,6 +2030,8 @@ paste_prepare() {
     }
     function priority(t, x) {
       x=tolower(t)
+      if(x ~ /^firewall drift|^panel .*\[timeout\]|^panel .*\[tls failure\]|^package apt dependency check exit=[1-9]|^package dpkg audit \(exit=|^package installed (i[^i ]|[^i])|unmet dependencies|depends:.*but|number of update exceeded/)return 10
+      if(x ~ /^panel detected |^panel listener |^panel .*http [0-9][0-9][0-9]|^package dpkg audit:|^package apt dependency check|^panel dns |^package candidate |^package installed |^firewall .*port=/)return 8
       if(target!="" && index(x,tolower(target)))return 7
       if(failure_group(x)!="" && failure_group(x)!="other error")return 6
       if(x ~ /oom-kill|killed process|out of memory|connection refused|upstream timed out|no matching listener|no unix socket|no local listener|server error|connect failure|tls failure|dns failure|timeout|timed out|fatal error|crash|corrupt|no space|inode usage|filesystem >=|max_children|http 5[0-9][0-9]|http 000|failed|disabled|inactive \(dead\)|status=exited|systemctl disable|systemctl stop|error:|denied/)return 5
@@ -1655,6 +2041,7 @@ paste_prepare() {
       return 1
     }
     function section_weight(h) {
+      if(h ~ /CONTROL PANEL|PACKAGE MANAGER|FIREWALL \/ SAVED VS LIVE/)return 8
       if(h ~ /TRAFFIC/)return 11
       if(h ~ /WEB STACK/)return 9
       if(h ~ /SERVICES \/ AUTOSTART/)return 7
